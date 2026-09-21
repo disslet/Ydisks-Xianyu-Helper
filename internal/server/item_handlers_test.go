@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -391,6 +392,160 @@ func TestPublishItemSuccess(t *testing.T) {
 	}
 }
 
+// TestPublishItemPassesPreferredCategory 验证单商品发布会把用户选择的完整类目传到平台端口。
+func TestPublishItemPassesPreferredCategory(t *testing.T) {
+	// srv、cleanup 保存当前测试服务器及清理函数。
+	srv, _, cleanup := newTestServer(t)
+	defer cleanup()
+	// receivedCategory 保存 HTTP 请求转换后的平台类目。
+	var receivedCategory *mtop.PublishCategory
+	setTestMTop(srv, &stubPublishMTop{publish: func(_ context.Context, _ string, request mtop.PublishItemRequest) (*mtop.PublishItemResult, error) {
+		receivedCategory = request.PreferredCategory
+		return &mtop.PublishItemResult{ItemID: "category-item", Title: "测试商品"}, nil
+	}})
+	// h 用于本次流程后续判断的路由处理器。
+	h := srv.Router()
+	// cookie 用于本次流程后续判断的登录会话 Cookie。
+	cookie := loginHelper(t, h)
+	// body、ct 保存带有完整类目字段的 multipart 请求。
+	body, ct := buildPublishMultipart(t, map[string]string{
+		"cookie_id": "acc1", "title": "测试商品", "price": "12.50", "quantity": "1",
+		"category_id": "5001", "category_name": "虚拟服务", "channel_category_id": "6001", "tb_category_id": "7001",
+	})
+	// req、rec 保存类目发布请求及 HTTP 响应。
+	req := httptest.NewRequest(http.MethodPost, "/items/publish", body)
+	req.Header.Set("Content-Type", ct)
+	req.AddCookie(cookie)
+	// rec 保存类目发布请求的 HTTP 响应。
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || receivedCategory == nil {
+		t.Fatalf("类目发布请求异常: status=%d category=%+v body=%s", rec.Code, receivedCategory, rec.Body.String())
+	}
+	if receivedCategory.CatID != "5001" || receivedCategory.CatName != "虚拟服务" || receivedCategory.ChannelCatID != "6001" || receivedCategory.TBCatID != "7001" {
+		t.Fatalf("平台收到的类目错误: %+v", receivedCategory)
+	}
+}
+
+// TestPublishItemParsesMultiSKUForm 验证 HTTP multipart 会把官方规格 JSON 转换为应用输入。
+func TestPublishItemParsesMultiSKUForm(t *testing.T) {
+	// srv、cleanup 保存当前测试服务器及清理函数。
+	srv, _, cleanup := newTestServer(t)
+	defer cleanup()
+	// receivedInput 保存平台发布端口收到的规格输入。
+	var receivedInput itemapp.PublishInput
+	setTestMTop(srv, &stubPublishMTop{publish: func(_ context.Context, _ string, request mtop.PublishItemRequest) (*mtop.PublishItemResult, error) {
+		receivedInput.Specs = make([]itemapp.PublishSpec, 0, len(request.Specs))
+		// spec 表示平台请求中的一个规格维度。
+		for _, spec := range request.Specs {
+			// values 保存当前规格维度的应用层规格值。
+			values := make([]itemapp.PublishSpecValue, 0, len(spec.Values))
+			// value 表示当前规格维度中的一个规格值。
+			for _, value := range spec.Values {
+				values = append(values, itemapp.PublishSpecValue{Value: value.Value, ImageIndex: value.ImageIndex})
+			}
+			receivedInput.Specs = append(receivedInput.Specs, itemapp.PublishSpec{PropertyName: spec.PropertyName, SupportImage: spec.SupportImage, Values: values})
+		}
+		receivedInput.SKUs = make([]itemapp.PublishSKU, 0, len(request.SKUs))
+		// sku 表示平台请求中的一个 SKU 组合。
+		for _, sku := range request.SKUs {
+			// properties 保存当前 SKU 的应用层规格名称和值对。
+			properties := make([]itemapp.PublishSKUProperty, 0, len(sku.PropertyList))
+			// property 表示当前 SKU 中的一组规格名称和值。
+			for _, property := range sku.PropertyList {
+				properties = append(properties, itemapp.PublishSKUProperty{PropertyText: property.PropertyText, ValueText: property.ValueText})
+			}
+			receivedInput.SKUs = append(receivedInput.SKUs, itemapp.PublishSKU{PriceCents: sku.PriceCents, Quantity: sku.Quantity, PropertyList: properties})
+		}
+		return &mtop.PublishItemResult{ItemID: "multi-item", Title: "多规格商品"}, nil
+	}})
+	// h、cookie 保存测试路由和登录 Cookie。
+	h := srv.Router()
+	// cookie 保存测试请求使用的登录 Cookie。
+	cookie := loginHelper(t, h)
+	// properties 保存前端提交的官方 itemProperties JSON。
+	properties := `[{"propertyName":"颜色","supportImage":false,"propertyValues":[{"propertyValue":"红色"},{"propertyValue":"蓝色"}]}]`
+	// skuList 保存前端提交的官方 itemSkuList JSON。
+	skuList := `[{"price":"9.90","quantity":2,"propertyList":[{"propertyText":"颜色","valueText":"红色"}]},{"price":"10.90","quantity":3,"propertyList":[{"propertyText":"颜色","valueText":"蓝色"}]}]`
+	// body、contentType 保存多规格 multipart 请求体。
+	body, contentType := buildPublishMultipart(t, map[string]string{"cookie_id": "acc1", "title": "多规格商品", "price": "", "quantity": "5", "item_properties": properties, "item_sku_list": skuList})
+	// req、rec 保存多规格发布请求和响应。
+	req := httptest.NewRequest(http.MethodPost, "/items/publish", body)
+	req.Header.Set("Content-Type", contentType)
+	req.AddCookie(cookie)
+	// rec 保存 HTTP 处理完成后的状态码和响应体。
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || len(receivedInput.Specs) != 1 || len(receivedInput.SKUs) != 2 {
+		t.Fatalf("多规格请求异常 status=%d specs=%+v skus=%+v body=%s", rec.Code, receivedInput.Specs, receivedInput.SKUs, rec.Body.String())
+	}
+	if receivedInput.Specs[0].PropertyName != "颜色" || receivedInput.SKUs[1].PriceCents != 1090 || receivedInput.SKUs[1].Quantity != 3 {
+		t.Fatalf("规格请求转换异常 specs=%+v skus=%+v", receivedInput.Specs, receivedInput.SKUs)
+	}
+}
+
+// TestPublishItemRejectsIncompletePreferredCategory 验证不完整类目不会进入远端发布并返回具体原因。
+func TestPublishItemRejectsIncompletePreferredCategory(t *testing.T) {
+	// srv、cleanup 保存当前测试服务器及清理函数。
+	srv, _, cleanup := newTestServer(t)
+	defer cleanup()
+	// called 保存平台发布端口是否被错误调用。
+	called := false
+	setTestMTop(srv, &stubPublishMTop{publish: func(context.Context, string, mtop.PublishItemRequest) (*mtop.PublishItemResult, error) {
+		called = true
+		return &mtop.PublishItemResult{ItemID: "unexpected"}, nil
+	}})
+	// h 用于本次流程后续判断的路由处理器。
+	h := srv.Router()
+	// cookie 用于本次流程后续判断的登录会话 Cookie。
+	cookie := loginHelper(t, h)
+	// body、ct 保存缺少频道类目 ID 的 multipart 请求。
+	body, ct := buildPublishMultipart(t, map[string]string{
+		"cookie_id": "acc1", "title": "测试商品", "price": "12.50", "quantity": "1",
+		"category_id": "5001", "category_name": "虚拟服务",
+	})
+	// req、rec 保存类目校验请求及 HTTP 响应。
+	req := httptest.NewRequest(http.MethodPost, "/items/publish", body)
+	req.Header.Set("Content-Type", ct)
+	req.AddCookie(cookie)
+	// rec 保存类目校验请求的 HTTP 响应。
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "类目信息不完整") || called {
+		t.Fatalf("不完整类目未被明确拒绝: status=%d called=%v body=%s", rec.Code, called, rec.Body.String())
+	}
+}
+
+// TestPublishItemReturnsRemoteFailureReason 验证未被专用错误类型包装的平台失败会把原因返回前端。
+func TestPublishItemReturnsRemoteFailureReason(t *testing.T) {
+	// srv、cleanup 用于本次流程后续判断的测试服务器及清理函数。
+	srv, _, cleanup := newTestServer(t)
+	defer cleanup()
+	// remoteFailure 保存模拟发布接口返回的详细平台失败原因。
+	remoteFailure := errors.New("mtop.idle.pc.idleitem.publish（HTTP 502）；平台原因：商品类目暂不可用")
+	setTestMTop(srv, &stubPublishMTop{publish: func(context.Context, string, mtop.PublishItemRequest) (*mtop.PublishItemResult, error) {
+		return nil, remoteFailure
+	}})
+	// h 用于本次流程后续判断的路由处理器。
+	h := srv.Router()
+	// cookie 用于本次流程后续判断的登录会话 Cookie。
+	cookie := loginHelper(t, h)
+	// body、ct 用于本次流程后续判断的 multipart 请求体及其内容类型。
+	body, ct := buildPublishMultipart(t, map[string]string{
+		"cookie_id": "acc1", "title": "测试商品", "price": "12.50", "quantity": "1",
+	})
+	// req 用于本次流程后续判断的发布请求。
+	req := httptest.NewRequest(http.MethodPost, "/items/publish", body)
+	req.Header.Set("Content-Type", ct)
+	req.AddCookie(cookie)
+	// rec 用于本次流程后续判断的响应记录器。
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "商品类目暂不可用") || strings.Contains(rec.Body.String(), "publish_result_missing_item_id") {
+		t.Fatalf("发布失败原因未返回: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 // TestPublishItemRejectsMissingRemoteItemID 封装Test发布商品RejectsMissingRemote商品ID业务协调。
 func TestPublishItemRejectsMissingRemoteItemID(t *testing.T) {
 	// srv、cleanup 用于本次流程后续判断的srv、cleanup
@@ -533,10 +688,7 @@ func TestSyncItemsFromAccountSuccess(t *testing.T) {
 	setTestMTop(srv, withMTopTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		// body 用于本次流程后续判断的请求体
 		body := `{"ret":["SUCCESS::调用成功"],"data":{"cardList":[` +
-			`{"cardData":{"id":"it-sync-1","title":"同步商品A","priceInfo":{"price":"12.50","preText":"¥"},"picInfo":{"picUrl":"https://img.alicdn.com/a.png"},"categoryId":"9","detailParams":{"itemId":"it-sync-1"}}}]}}`
-		if req.URL.Query().Get("api") == "mtop.taobao.idle.pc.detail" {
-			body = `{"ret":["SUCCESS::调用成功"],"data":{"multiSKU":true,"skuDO":{"skuList":[{"id":"sku-a"},{"id":"sku-b"}]}}}`
-		}
+			`{"cardData":{"id":"it-sync-1","title":"同步商品A","priceInfo":{"price":"12.50","preText":"¥"},"picInfo":{"picUrl":"https://img.alicdn.com/a.png"},"categoryId":"9","detailParams":{"itemId":"it-sync-1","isSKU":true}}}]}}`
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
@@ -581,6 +733,60 @@ func TestSyncItemsFromAccountSuccess(t *testing.T) {
 	if item.ItemID != "it-sync-1" || item.ItemTitle != "同步商品A" || item.ItemPrice != "¥12.50" || item.ItemDescription != "本地描述" ||
 		!item.IsMultiSpec || !item.MultiQuantityDelivery {
 		t.Fatalf("线上商品更新或本地配置保留异常: %+v", item)
+	}
+}
+
+// TestSyncItemsFromAccountTreatsMissingCardListAsEmpty 验证无商品账号的真实成功结构不会被映射为 502，且会清理本地过期商品。
+func TestSyncItemsFromAccountTreatsMissingCardListAsEmpty(t *testing.T) {
+	// srv、store、cleanup 保存真实 HTTP 同步链路所需的测试服务、存储和释放函数。
+	srv, store, cleanup := newTestServer(t)
+	defer cleanup()
+	// ctx 保存准备本地旧商品时使用的数据库上下文。
+	ctx := context.Background()
+	// upsertErr 保存写入待同步清理的本地旧商品时产生的错误。
+	upsertErr := store.Items.Upsert(ctx, &db.ItemInfoRow{CookieID: "acc1", ItemID: "stale-item", ItemTitle: "已下架商品"})
+	if upsertErr != nil {
+		t.Fatal(upsertErr)
+	}
+	// previousClient 保存测试前的 MTOP 客户端，结束后必须恢复以隔离其他 HTTP 测试。
+	previousClient := testMTop(srv)
+	// emptyListTransport 返回闲鱼现场验证的无商品成功结构，不提供 cardList 字段。
+	emptyListTransport := withMTopTransport(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		// body 保存不含商品卡片但总数明确为零的平台成功响应。
+		body := `{"ret":["SUCCESS::调用成功"],"data":{"totalCount":0,"itemTopicList":[],"nextPage":false}}`
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+	}))
+	setTestMTop(srv, emptyListTransport)
+	defer func() { setTestMTop(srv, previousClient) }()
+	// handler 保存当前服务路由，供认证后的商品同步请求使用。
+	handler := srv.Router()
+	// sessionCookie 保存管理员登录后访问受保护同步路由所需的会话 Cookie。
+	sessionCookie := loginHelper(t, handler)
+	// request 保存触发商品全量同步的版本化 HTTP 请求。
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/items/get-all-from-account", strings.NewReader(`{"cookie_id":"acc1","page_size":20}`))
+	request.AddCookie(sessionCookie)
+	// recorder 保存同步处理器返回的统一 HTTP 响应。
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("无商品同步状态=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	// response 保存版本化同步接口的业务结果，用于确认本地旧商品已按空全集对齐。
+	var response struct {
+		// SavedCount 保存本次从远端空全集新增或更新的商品数量。
+		SavedCount int `json:"saved_count"`
+		// DeletedCount 保存本次软删除的本地旧商品数量。
+		DeletedCount int `json:"deleted_count"`
+	}
+	// decodeErr 保存 HTTP JSON 响应解析错误。
+	decodeErr := json.Unmarshal(recorder.Body.Bytes(), &response)
+	if decodeErr != nil || response.SavedCount != 0 || response.DeletedCount != 1 {
+		t.Fatalf("无商品同步结果异常: response=%+v err=%v", response, decodeErr)
+	}
+	// items、itemsErr 保存空全集同步后的本地商品列表及查询错误。
+	items, itemsErr := store.Items.AllForCookie(ctx, "acc1")
+	if itemsErr != nil || len(items) != 0 {
+		t.Fatalf("本地旧商品未按空全集清理: items=%+v err=%v", items, itemsErr)
 	}
 }
 
@@ -643,19 +849,17 @@ func TestSyncItemsFromAccountReleasesCredentialLockDuringRemoteCall(t *testing.T
 	}
 }
 
-// TestSyncItemsFromAccountDetectsMultiSpecFromDetail 封装TestSync商品列表From账号DetectsMultiSpecFromDetail业务协调。
-func TestSyncItemsFromAccountDetectsMultiSpecFromDetail(t *testing.T) {
+// TestSyncItemsFromAccountReadsMultiSpecFromList 验证商品同步只读取列表 isSKU 真值，不访问商品详情页。
+func TestSyncItemsFromAccountReadsMultiSpecFromList(t *testing.T) {
 	// srv、store、cleanup 用于本次流程后续判断的srv、store、cleanup
 	srv, store, cleanup := newTestServer(t)
 	defer cleanup()
 	setTestMTop(srv, withMTopTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		// body 用于本次流程后续判断的请求体
-		body := `{"ret":["SUCCESS::调用成功"],"data":{}}`
-		if strings.Contains(req.URL.String(), "mtop.idle.web.xyh.item.list") {
-			body = `{"ret":["SUCCESS::调用成功"],"data":{"cardList":[{"cardData":{"id":"multi-item","title":"多规格商品","detailParams":{"itemId":"multi-item"}}}]}}`
-		} else if strings.Contains(req.URL.String(), "mtop.taobao.idle.pc.detail") {
-			body = `{"ret":["SUCCESS::调用成功"],"data":{"multiSKU":true,"skuDO":{"skuList":[{"id":"a"},{"id":"b"}]}}}`
+		if !strings.Contains(req.URL.String(), "mtop.idle.web.xyh.item.list") {
+			t.Errorf("商品同步不应请求详情页: %s", req.URL.String())
 		}
+		// body 保存列表接口携带多规格真值的成功响应。
+		body := `{"ret":["SUCCESS::调用成功"],"data":{"cardList":[{"cardData":{"id":"multi-item","title":"多规格商品","detailParams":{"itemId":"multi-item","isSKU":true}}}]}}`
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
 	})))
 	// h 用于本次流程后续判断的h

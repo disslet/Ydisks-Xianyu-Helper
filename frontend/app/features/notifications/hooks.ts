@@ -1,6 +1,6 @@
 import { useCallback,useEffect,useRef,useState } from 'react';
 import type { NotificationChannel,SystemSettings } from './api';
-import { createNotificationChannel,deleteNotificationChannel,getNotificationChannels,getSystemSettings,testNotificationChannel,updateNotificationChannel,updateSystemSettings } from './api';
+import { createNotificationChannel,deleteNotificationChannel,getNotificationChannel,getNotificationChannels,getSystemSettings,testNotificationChannel,updateNotificationChannel,updateSystemSettings } from './api';
 import { buildNotificationPayload,emptyNotificationForm,isCurrentNotificationRequest,normalizeNotificationForm,notificationErrorMessage,validateNotificationForm } from './state';
 import type { NotificationForm,NotificationState } from './types';
 
@@ -44,6 +44,10 @@ export const useNotifications = (isAdmin: boolean): NotificationState => {
   const actionAbort = useRef<AbortController | null>(null);
   // toastTimer 保存提示自动消失的定时器句柄。
   const toastTimer = useRef<number | null>(null);
+  // editorGeneration 隔离连续打开不同渠道时产生的旧编辑配置响应。
+  const editorGeneration = useRef(0);
+  // editorAbort 保存当前编辑配置请求的取消控制器。
+  const editorAbort = useRef<AbortController | null>(null);
 
   // showToast 展示短暂提示并清理上一条提示的定时器。
   const showToast = useCallback(
@@ -131,6 +135,8 @@ export const useNotifications = (isAdmin: boolean): NotificationState => {
           channelAbort.current?.abort();
           smtpGeneration.current += 1;
           smtpAbort.current?.abort();
+          editorGeneration.current += 1;
+          editorAbort.current?.abort();
         }
       );
     },
@@ -138,10 +144,12 @@ export const useNotifications = (isAdmin: boolean): NotificationState => {
   );
 
   useEffect(
-    // 提示清理副作用负责页面卸载时释放自动消失定时器。
+    // 卸载清理负责终止渠道动作的展示生命周期并释放提示定时器。
     () => (
-      // toastCleanup 在页面卸载时释放定时器。
+      // toastCleanup 在页面卸载时取消渠道动作、使旧结果失效并释放定时器。
       () => {
+        actionGeneration.current += 1;
+        actionAbort.current?.abort();
         if (toastTimer.current !== null) window.clearTimeout(toastTimer.current);
       }
     ),
@@ -152,6 +160,8 @@ export const useNotifications = (isAdmin: boolean): NotificationState => {
   const openCreate = useCallback(
     // 新建回调重置表单并打开渠道弹窗。
     () => {
+    editorGeneration.current += 1;
+    editorAbort.current?.abort();
     setEditing(null);
     setForm(emptyNotificationForm());
     setShowChannelSmtpPassword(false);
@@ -160,16 +170,35 @@ export const useNotifications = (isAdmin: boolean): NotificationState => {
     [],
   );
 
-  // openEdit 打开已有渠道并归一化邮件渠道配置。
+  // openEdit 先读取脱敏编辑配置再开放表单；关闭、切换或新建使旧请求失效，避免晚到响应覆盖输入。
   const openEdit = useCallback(
-    // 编辑回调载入渠道配置并打开弹窗。
-    (channel: NotificationChannel) => {
-    setEditing(channel);
-    setForm(normalizeNotificationForm(channel, smtp));
-    setShowChannelSmtpPassword(false);
-    setShowModal(true);
+    // channel 是本次编辑对象；加载期间关闭旧表单，只有仍属于当前代次的响应能打开新表单。
+    async (channel: NotificationChannel) => {
+      // generation 标记本次编辑加载，隔离取消与连续打开不同渠道的结果。
+      const generation = ++editorGeneration.current;
+      editorAbort.current?.abort();
+      // controller 控制当前读取的取消，不参与保存请求的生命周期。
+      const controller = new AbortController();
+      editorAbort.current = controller;
+      setShowModal(false);
+      try {
+        // editor 只含收件地址与模式标记，SMTP 秘密始终留在服务端。
+        const editor = await getNotificationChannel(channel.id, { signal: controller.signal });
+        if (generation !== editorGeneration.current || controller.signal.aborted) return;
+        // initialForm 是读取完成后一次性建立的表单，之后不再由该请求回填。
+        const initialForm = normalizeNotificationForm(channel, smtp);
+        setEditing(channel);
+        setForm(channel.type === 'email' ? {
+          ...initialForm, preserveSMTP: true,
+          config: { to_email: editor.to_email || '', use_custom_smtp: editor.use_custom_smtp === true },
+        } : initialForm);
+        setShowChannelSmtpPassword(false);
+        setShowModal(true);
+      } catch (error: unknown /* 编辑读取失败时仅显示可读错误，不开放缺少配置的表单。 */) {
+        if (generation === editorGeneration.current && !controller.signal.aborted) showToast('error', notificationErrorMessage(error, '读取渠道配置失败'));
+      }
     },
-    [smtp],
+    [showToast, smtp],
   );
 
   // closeModal 关闭渠道弹窗并取消未完成的保存动作。
@@ -177,7 +206,10 @@ export const useNotifications = (isAdmin: boolean): NotificationState => {
     // 关闭回调使保存请求失效并隐藏弹窗。
     () => {
     actionGeneration.current += 1;
+    setTestingId('');
     actionAbort.current?.abort();
+    editorGeneration.current += 1;
+    editorAbort.current?.abort();
     setSaving(false);
     setShowModal(false);
     },
@@ -196,6 +228,8 @@ export const useNotifications = (isAdmin: boolean): NotificationState => {
     }
     // generation 标记当前渠道保存动作的代次。
     const generation = ++actionGeneration.current;
+    // 替换动作时主动清理被取消测试的忙碌状态；旧 finally 已没有当前代次。
+    setTestingId('');
     actionAbort.current?.abort();
     // controller 允许关闭弹窗时取消保存请求。
     const controller = new AbortController();
@@ -207,7 +241,7 @@ export const useNotifications = (isAdmin: boolean): NotificationState => {
       if (editing) {
         await updateNotificationChannel(editing.id, payload, { signal: controller.signal });
       } else {
-        await createNotificationChannel(payload, { signal: controller.signal });
+        await createNotificationChannel({ ...payload, config: payload.config || {} }, { signal: controller.signal });
       }
       if (!isCurrentNotificationRequest(generation, actionGeneration.current)) return;
       setShowModal(false);
@@ -232,6 +266,8 @@ export const useNotifications = (isAdmin: boolean): NotificationState => {
     if (!confirm(`确认删除渠道「${channel.name}」吗？已绑定该渠道的账号会自动解绑。`)) return;
     // generation 标记当前删除动作的代次。
     const generation = ++actionGeneration.current;
+    // 替换动作时主动清理被取消测试的忙碌状态；旧 finally 已没有当前代次。
+    setTestingId('');
     actionAbort.current?.abort();
     // controller 允许刷新页面时取消删除请求。
     const controller = new AbortController();
@@ -257,6 +293,8 @@ export const useNotifications = (isAdmin: boolean): NotificationState => {
     async (channel: NotificationChannel) => {
     // generation 标记当前启用状态动作的代次。
     const generation = ++actionGeneration.current;
+    // 替换动作时主动清理被取消测试的忙碌状态；旧 finally 已没有当前代次。
+    setTestingId('');
     actionAbort.current?.abort();
     // controller 允许新的渠道动作取消旧请求。
     const controller = new AbortController();

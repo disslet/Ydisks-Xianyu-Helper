@@ -28,6 +28,22 @@ type fakeMTop struct {
 	consignPicListIn []string
 	consignCookies   []string
 	consignResults   []fakeConsignResult
+	// freeShippingErr 是砍价订单免拼发货调用的预置传输错误。
+	freeShippingErr error
+	// freeShippingOK 是砍价订单免拼发货调用的预置业务成功标志。
+	freeShippingOK bool
+	// freeShippingRet 是砍价订单免拼发货调用的预置业务返回。
+	freeShippingRet []string
+	// freeShippingUpdated 是砍价订单免拼发货调用返回的扁平 Cookie 更新。
+	freeShippingUpdated string
+	// freeShippingCookies 按调用顺序记录免拼请求使用的凭证，供会话恢复重试断言。
+	freeShippingCookies []string
+	// freeShippingResults 是按调用顺序消费的免拼结果，用于模拟恢复前后不同的平台响应。
+	freeShippingResults []fakeFreeShippingResult
+	// freeShippingCalls 统计砍价订单免拼发货调用次数。
+	freeShippingCalls int
+	// freeShippingOrderIn、freeShippingItemIn、freeShippingBuyerIn 记录免拼发货请求的三个平台标识。
+	freeShippingOrderIn, freeShippingItemIn, freeShippingBuyerIn string
 	// consignStarted 通知测试外部 Consign 调用已经开始。
 	consignStarted chan struct{}
 	// consignRelease 控制测试外部 Consign 调用何时返回。
@@ -62,6 +78,18 @@ type fakeConsignResult struct {
 	ret     []string
 	updated string
 	err     error
+}
+
+// fakeFreeShippingResult 是单次免拼调用的业务结果、Cookie 更新与请求错误。
+type fakeFreeShippingResult struct {
+	// ok 表示平台是否明确确认免拼成功。
+	ok bool
+	// ret 保存平台返回的业务结果码。
+	ret []string
+	// updated 保存平台响应携带的扁平 Cookie 更新。
+	updated string
+	// err 保存请求或响应解析阶段的调用错误。
+	err error
 }
 
 // fakeAdjustPriceResult 是单次订单改价调用的预置业务结果、Cookie 更新与传输错误。
@@ -128,6 +156,22 @@ func (f *fakeMTop) ConsignContextWithDelivery(_ context.Context, cookiesStr, ord
 		return result.ok, result.ret, result.updated, result.err
 	}
 	return f.consignOk, f.consignRet, f.consignUpdated, f.consignErr
+}
+
+// FreeShippingContext 返回测试预置的免拼发货结果并记录请求的凭证、订单、商品和买家标识。
+func (f *fakeMTop) FreeShippingContext(_ context.Context, cookieStr, orderID, itemID, buyerID string) (bool, []string, string, error) {
+	f.freeShippingCalls++
+	f.freeShippingCookies = append(f.freeShippingCookies, cookieStr)
+	f.freeShippingOrderIn = orderID
+	f.freeShippingItemIn = itemID
+	f.freeShippingBuyerIn = buyerID
+	if len(f.freeShippingResults) > 0 {
+		// result 保存当前调用消费的预置免拼结果。
+		result := f.freeShippingResults[0]
+		f.freeShippingResults = f.freeShippingResults[1:]
+		return result.ok, result.ret, result.updated, result.err
+	}
+	return f.freeShippingOK, f.freeShippingRet, f.freeShippingUpdated, f.freeShippingErr
 }
 
 // TestConfirmShipmentReleasesCredentialLockBeforeExternalIO 验证 MTOP 外部调用期间同账号凭证锁可以被其他流程获取。
@@ -260,7 +304,7 @@ type fakeCredentialRecoverer struct {
 
 // FetchOrderDetail 封装Fetch订单Detail业务协调。
 func (f *fakeCredentialRecoverer) FetchOrderDetail(context.Context, string, string, string, string, string) (*OrderDetail, error) {
-	return &OrderDetail{Quantity: "1", Amount: "9.9"}, nil
+	return &OrderDetail{Quantity: "1", Amount: "9.9", OrderStatus: "pending_ship"}, nil
 }
 
 // RecoverExpiredCredential 封装RecoverExpiredCredential业务协调。
@@ -319,7 +363,7 @@ func TestConfirmShipmentRetriesFromCheckpointWithoutResendingCard(t *testing.T) 
 		OrderDetailFetcher: recoverer,
 	})
 	// task 用于本次流程后续判断的任务
-	task := Task{AccountID: "cid", TriggerType: TriggerOrderPaid, OrderID: "checkpoint-order",
+	task := Task{Source: "ws", AccountID: "cid", OrderRole: OrderRoleSeller, TriggerType: TriggerOrderPaid, OrderID: "checkpoint-order",
 		ItemID: "checkpoint-item", BuyerID: "buyer", ChatID: "chat", Quantity: "1", Amount: "9.9"}
 	if // err 用于本次流程后续判断的err
 	err := center.HandleTask(ctx, task); err == nil {
@@ -352,7 +396,7 @@ func TestConfirmShipmentRetriesFromCheckpointWithoutResendingCard(t *testing.T) 
 	if mtopMock.consignTradeTextIn != "ONLY-ONCE" {
 		t.Fatalf("恢复确认发货未携带已发送卡密凭证: %q", mtopMock.consignTradeTextIn)
 	}
-	// runAfterRecovery 保存恢复任务完成后的运行状态，用于确认敏感凭证已清除。
+	// runAfterRecovery 保存恢复任务完成后的运行状态，用于确认加密发货快照仍可用于订单级原样补发。
 	var runAfterRecovery db.AutomationRun
 	// err 保存恢复运行状态读取错误。
 	if err := store.DB.QueryRowContext(ctx, `SELECT status,sent_count FROM automation_runs WHERE order_id=?`, task.OrderID).Scan(&runAfterRecovery.Status, &runAfterRecovery.SentCount); err != nil {
@@ -361,14 +405,14 @@ func TestConfirmShipmentRetriesFromCheckpointWithoutResendingCard(t *testing.T) 
 	if runAfterRecovery.Status != "success" || runAfterRecovery.SentCount != 1 {
 		t.Fatalf("恢复运行状态异常: status=%q sent=%d", runAfterRecovery.Status, runAfterRecovery.SentCount)
 	}
-	// rawProof 保存恢复成功后的数据库凭证，确认终态不会继续保留敏感内容。
+	// rawProof 保存恢复成功后的数据库快照密文，确认终态仍保留原样补发所需内容。
 	var rawProof string
 	// err 保存恢复成功后凭证读取错误。
 	if err := store.DB.QueryRowContext(ctx, `SELECT delivery_proof FROM automation_runs WHERE order_id=?`, task.OrderID).Scan(&rawProof); err != nil {
 		t.Fatal(err)
 	}
-	if rawProof != "" {
-		t.Fatalf("恢复成功后应清除发货凭证: %q", rawProof)
+	if rawProof == "" {
+		t.Fatal("恢复成功后必须保留加密发货快照")
 	}
 }
 
@@ -419,7 +463,7 @@ func TestConfirmShipmentRetriesFromCheckpointWithoutResendingTemplate(t *testing
 	// center 保存模板恢复测试使用的自动化中心。
 	center := NewWithDependencies(store, testSenderProvider{sender: sender}, nil, CenterDependencies{MTop: mtopMock, OrderDetailFetcher: recoverer})
 	// task 保存模板恢复测试的订单任务。
-	task := Task{AccountID: "cid", TriggerType: TriggerOrderPaid, OrderID: "template-recovery-order", ItemID: "template-recovery-item", BuyerID: "buyer", ChatID: "chat", Quantity: "1"}
+	task := Task{Source: "ws", AccountID: "cid", OrderRole: OrderRoleSeller, TriggerType: TriggerOrderPaid, OrderID: "template-recovery-order", ItemID: "template-recovery-item", BuyerID: "buyer", ChatID: "chat", Quantity: "1"}
 	// firstErr 保存首次确认发货因凭证恢复失败而返回的错误。
 	firstErr := center.HandleTask(ctx, task)
 	if firstErr == nil {
@@ -457,14 +501,14 @@ func TestConfirmShipmentRetriesFromCheckpointWithoutResendingTemplate(t *testing
 	if mtopMock.consignCalls != 2 || mtopMock.consignTradeTextIn != "订单 template-recovery-order 卡密 TEMPLATE-ONCE" {
 		t.Fatalf("恢复确认发货凭证错误: calls=%d trade_text=%q", mtopMock.consignCalls, mtopMock.consignTradeTextIn)
 	}
-	// clearedProof 保存恢复成功后的凭证值，确认终态必须清除敏感内容。
-	var clearedProof string
+	// retainedProof 保存恢复成功后的凭证值，确认终态必须保留加密内容快照。
+	var retainedProof string
 	// scanErr 保存恢复成功后凭证读取错误。
-	if scanErr := store.DB.QueryRowContext(ctx, `SELECT delivery_proof FROM automation_runs WHERE order_id=?`, task.OrderID).Scan(&clearedProof); scanErr != nil {
+	if scanErr := store.DB.QueryRowContext(ctx, `SELECT delivery_proof FROM automation_runs WHERE order_id=?`, task.OrderID).Scan(&retainedProof); scanErr != nil {
 		t.Fatal(scanErr)
 	}
-	if clearedProof != "" {
-		t.Fatalf("模板确认成功后凭证未清除: %q", clearedProof)
+	if retainedProof == "" {
+		t.Fatal("模板确认成功后必须保留加密发货快照")
 	}
 }
 
@@ -539,7 +583,7 @@ func TestCenterConfirmShipment_MockMTopConsigError(t *testing.T) {
 
 	// HandleTask 内部记录 executeRule 失败到 automation_runs（不向上透传错误）。
 	_ = center.HandleTask(ctx, Task{
-		Source: "ws", AccountID: "cid", CookieStr: "unb=1; _m_h5_tk=tk;", TriggerType: TriggerOrderPaid,
+		Source: "ws", AccountID: "cid", OrderRole: OrderRoleSeller, CookieStr: "unb=1; _m_h5_tk=tk;", TriggerType: TriggerOrderPaid,
 		ChatID: "chat-1", OrderID: "order-mock", ItemID: "item-1", BuyerID: "buyer-1",
 	})
 	if mtopMock.consignCalls != 1 {
@@ -571,7 +615,7 @@ func TestCenterConfirmShipment_MockMTopConsigError(t *testing.T) {
 		OrderDetailFetcher: testFetcher{detail: &OrderDetail{Quantity: "1", Amount: "9.9"}},
 	})
 	_ = center2.HandleTask(ctx, Task{
-		Source: "ws", AccountID: "cid", CookieStr: "unb=1; _m_h5_tk=tk;", TriggerType: TriggerOrderPaid,
+		Source: "ws", AccountID: "cid", OrderRole: OrderRoleSeller, CookieStr: "unb=1; _m_h5_tk=tk;", TriggerType: TriggerOrderPaid,
 		ChatID: "chat-2", OrderID: "order-mock2", ItemID: "item-1", BuyerID: "buyer-1",
 	})
 	store.DB.QueryRowContext(ctx, `SELECT status FROM automation_runs WHERE order_id='order-mock2'`).Scan(&runStatus)
@@ -620,7 +664,7 @@ func TestPaidTemplateWithZeroRenderedMessagesDoesNotConfirmShipment(t *testing.T
 		OrderDetailFetcher: testFetcher{detail: &OrderDetail{Quantity: "1", Amount: "9.9"}},
 	})
 	// task 是缺少买家昵称、会把模板渲染为空的付款订单任务。
-	task := Task{Source: "ws", AccountID: "cid", CookieStr: "unb=1; _m_h5_tk=tk;", TriggerType: TriggerOrderPaid,
+	task := Task{Source: "ws", AccountID: "cid", OrderRole: OrderRoleSeller, CookieStr: "unb=1; _m_h5_tk=tk;", TriggerType: TriggerOrderPaid,
 		ChatID: "chat-zero", OrderID: "order-zero-message", ItemID: "zero-message-item", BuyerID: "buyer-zero", Quantity: "1"}
 	// runErr 保存规则执行错误；零消息是确定未发送，应允许安全重试而不确认发货。
 	runErr := center.HandleTask(ctx, task)

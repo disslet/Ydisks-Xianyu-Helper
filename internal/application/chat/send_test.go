@@ -29,11 +29,11 @@ func (r *sendRepository) CreateOutgoing(_ context.Context, session Session, _ st
 }
 
 // CreateOutgoingMedia 创建测试媒体消息。
-func (r *sendRepository) CreateOutgoingMedia(_ context.Context, session Session, _, content string) (Message, error) {
+func (r *sendRepository) CreateOutgoingMedia(_ context.Context, session Session, messageType, content string) (Message, error) {
 	if r.createErr != nil {
 		return Message{}, r.createErr
 	}
-	r.message = Message{ID: 2, AccountID: session.AccountID, ChatID: session.ChatID, MessageKey: "local-image", Content: content, Status: "sending"}
+	r.message = Message{ID: 2, AccountID: session.AccountID, ChatID: session.ChatID, MessageKey: "local-image", MessageType: messageType, Content: content, Status: "sending"}
 	return r.message, nil
 }
 
@@ -50,7 +50,7 @@ func (r *sendRepository) SetOutgoingStatus(_ context.Context, _, _ string, statu
 // sendProvider 是按账号返回固定发送器的测试替身。
 type sendProvider struct {
 	// sender 保存测试发送器；为 nil 时模拟离线账号。
-	sender *sendSender
+	sender Sender
 }
 
 // TestServiceAvailabilityReportsRequiredPorts 验证发送和图片上传能力只由应用端口装配状态决定。
@@ -89,10 +89,17 @@ type sendSender struct {
 	updatedCookie bool
 	// imageWidth、imageHeight 保存图片发送收到的像素尺寸。
 	imageWidth, imageHeight int
+	// itemChatID、itemPeerUserID 和 itemKey 保存商品卡片发送使用的本地会话身份与幂等键。
+	itemChatID, itemPeerUserID, itemKey string
+	// item 保存商品卡片发送器收到的规范商品快照。
+	item ChatItem
+	// calls 保存完整回复发送时图片和文字的调用顺序。
+	calls []string
 }
 
 // SendText 记录文本发送并返回预设错误。
 func (s *sendSender) SendText(_ context.Context, _, _, _, messageKey string) error {
+	s.calls = append(s.calls, "text")
 	s.sentKey = messageKey
 	return s.sendErr
 }
@@ -101,7 +108,14 @@ func (s *sendSender) SendText(_ context.Context, _, _, _, messageKey string) err
 func (s *sendSender) SendImage(_ context.Context, _, _, _ string, _ int64, width, height int, messageKey string) error {
 	// imageWidth、imageHeight 记录应用层透传的平台图片尺寸。
 	s.imageWidth, s.imageHeight = width, height
+	s.calls = append(s.calls, "image")
 	s.sentKey = messageKey
+	return s.sendErr
+}
+
+// SendItemCard 记录商品卡片发送目标、快照和幂等键，并返回预设平台错误。
+func (s *sendSender) SendItemCard(_ context.Context, chatID, toUserID string, item ChatItem, messageKey string) error {
+	s.itemChatID, s.itemPeerUserID, s.itemKey, s.item = chatID, toUserID, messageKey, item
 	return s.sendErr
 }
 
@@ -130,7 +144,7 @@ func TestSendTextSuccessPreservesIdempotencyKey(t *testing.T) {
 	// service 保存使用测试端口构造的聊天发送服务。
 	service := NewWithSending(nil, repository, sendProvider{sender: sender}, nil)
 	// message 和 err 保存应用层返回的消息及错误。
-	message, err := service.SendText(context.Background(), OutgoingInput{Session: Session{AccountID: "acc-1", ChatID: "chat-1", BuyerID: "buyer-1"}, Text: "  你好  "})
+	message, err := service.SendText(context.Background(), OutgoingInput{Session: Session{AccountID: "acc-1", ChatID: "chat-1", PeerUserID: "buyer-1"}, Text: "  你好  "})
 	if err != nil || message == nil || message.Status != "sent" || sender.sentKey != "local-1" {
 		t.Fatalf("message=%+v err=%v key=%q", message, err, sender.sentKey)
 	}
@@ -146,7 +160,7 @@ func TestSendTextFailureMarksMessageFailed(t *testing.T) {
 	// service 保存使用测试端口构造的聊天发送服务。
 	service := NewWithSending(nil, repository, sendProvider{sender: sender}, nil)
 	// message 和 err 保存失败后的本地消息及错误。
-	message, err := service.SendText(context.Background(), OutgoingInput{Session: Session{AccountID: "acc-1", ChatID: "chat-1", BuyerID: "buyer-1"}, Text: "你好"})
+	message, err := service.SendText(context.Background(), OutgoingInput{Session: Session{AccountID: "acc-1", ChatID: "chat-1", PeerUserID: "buyer-1"}, Text: "你好"})
 	if !errors.Is(err, ErrSend) || message == nil || message.Status != "failed" {
 		t.Fatalf("message=%+v err=%v", message, err)
 	}
@@ -162,7 +176,7 @@ func TestSendTextStatusFailureReturnsSentMessage(t *testing.T) {
 	// service 保存使用测试端口构造的聊天发送服务。
 	service := NewWithSending(nil, repository, sendProvider{sender: sender}, nil)
 	// message 和 err 保存状态写入失败的返回值。
-	message, err := service.SendText(context.Background(), OutgoingInput{Session: Session{AccountID: "acc-1", ChatID: "chat-1", BuyerID: "buyer-1"}, Text: "你好"})
+	message, err := service.SendText(context.Background(), OutgoingInput{Session: Session{AccountID: "acc-1", ChatID: "chat-1", PeerUserID: "buyer-1"}, Text: "你好"})
 	if !errors.Is(err, ErrStatusSave) || message == nil || message.MessageKey != "local-1" {
 		t.Fatalf("message=%+v err=%v", message, err)
 	}
@@ -177,7 +191,7 @@ func TestSendTextPropagatesOutgoingCreationFailure(t *testing.T) {
 	// service 是绑定本地创建失败端口的聊天发送服务。
 	service := NewWithSending(nil, &sendRepository{createErr: createErr}, sendProvider{sender: sender}, nil)
 	// returnedErr 保存应用服务返回的创建失败错误。
-	_, returnedErr := service.SendText(context.Background(), OutgoingInput{Session: Session{AccountID: "acc-1", ChatID: "chat-1", BuyerID: "buyer-1"}, Text: "你好"})
+	_, returnedErr := service.SendText(context.Background(), OutgoingInput{Session: Session{AccountID: "acc-1", ChatID: "chat-1", PeerUserID: "buyer-1"}, Text: "你好"})
 	if returnedErr == nil || !strings.Contains(returnedErr.Error(), "create outgoing failed") || sender.sentKey != "" {
 		t.Fatalf("创建外发消息失败未透传：err=%v sender=%q", returnedErr, sender.sentKey)
 	}
@@ -186,7 +200,7 @@ func TestSendTextPropagatesOutgoingCreationFailure(t *testing.T) {
 // TestSendRejectsUnavailableOfflineAndInvalidInputs 验证不可用、离线和非法输入均在访问端口前失败。
 func TestSendRejectsUnavailableOfflineAndInvalidInputs(t *testing.T) {
 	// session 保存可复用的有效会话参数。
-	session := Session{AccountID: "acc-1", ChatID: "chat-1", BuyerID: "buyer-1"}
+	session := Session{AccountID: "acc-1", ChatID: "chat-1", PeerUserID: "buyer-1"}
 	// cases 描述发送服务边界分支。
 	cases := []struct {
 		// name 标识当前测试分支。
@@ -223,7 +237,7 @@ func TestSendImageDoesNotExposeCredentials(t *testing.T) {
 	// service 保存使用测试端口构造的聊天发送服务。
 	service := NewWithSending(nil, repository, sendProvider{sender: sender}, uploader)
 	// message 和 err 保存图片发送结果。
-	message, err := service.SendImage(context.Background(), ImageInput{Session: Session{AccountID: "acc-1", ChatID: "chat-1", BuyerID: "buyer-1"}, Filename: "a.jpg", ContentType: "image/jpeg", Data: []byte("image")})
+	message, err := service.SendImage(context.Background(), ImageInput{Session: Session{AccountID: "acc-1", ChatID: "chat-1", PeerUserID: "buyer-1"}, Filename: "a.jpg", ContentType: "image/jpeg", Data: []byte("image")})
 	if err != nil || message == nil || message.Content != "https://cdn.example/image.jpg" || sender.sentKey != "local-image" || sender.imageWidth != 1280 || sender.imageHeight != 720 {
 		t.Fatalf("message=%+v err=%v key=%q", message, err, sender.sentKey)
 	}
@@ -238,7 +252,7 @@ func TestSendImagePropagatesCredentialWritebackFailure(t *testing.T) {
 	// service 保存使用测试端口构造的聊天发送服务。
 	service := NewWithSending(nil, repository, sendProvider{sender: sender}, uploader)
 	// _, err 保存图片上传适配器返回的确定性错误。
-	_, err := service.SendImage(context.Background(), ImageInput{Session: Session{AccountID: "acc-1", ChatID: "chat-1", BuyerID: "buyer-1"}, Filename: "a.jpg", ContentType: "image/jpeg", Data: []byte("image")})
+	_, err := service.SendImage(context.Background(), ImageInput{Session: Session{AccountID: "acc-1", ChatID: "chat-1", PeerUserID: "buyer-1"}, Filename: "a.jpg", ContentType: "image/jpeg", Data: []byte("image")})
 	if !errors.Is(err, ErrSend) || sender.sentKey != "" || len(repository.statuses) != 0 {
 		t.Fatalf("err=%v sentKey=%q statuses=%v", err, sender.sentKey, repository.statuses)
 	}
@@ -253,7 +267,7 @@ func TestSendImageStatusFailureReturnsSentMessage(t *testing.T) {
 	// service 保存使用测试端口构造的聊天发送服务。
 	service := NewWithSending(nil, repository, sendProvider{sender: sender}, uploader)
 	// message 和 err 保存图片状态写入失败后的返回值。
-	message, err := service.SendImage(context.Background(), ImageInput{Session: Session{AccountID: "acc-1", ChatID: "chat-1", BuyerID: "buyer-1"}, Filename: "a.jpg", ContentType: "image/jpeg", Data: []byte("image")})
+	message, err := service.SendImage(context.Background(), ImageInput{Session: Session{AccountID: "acc-1", ChatID: "chat-1", PeerUserID: "buyer-1"}, Filename: "a.jpg", ContentType: "image/jpeg", Data: []byte("image")})
 	if !errors.Is(err, ErrStatusSave) || message == nil || message.MessageKey != "local-image" || sender.sentKey != "local-image" {
 		t.Fatalf("message=%+v err=%v key=%q", message, err, sender.sentKey)
 	}
@@ -262,7 +276,7 @@ func TestSendImageStatusFailureReturnsSentMessage(t *testing.T) {
 // TestSendImageCoversValidationUploadCreationAndPlatformFailures 验证图片发送在各外发阶段失败时的稳定错误语义。
 func TestSendImageCoversValidationUploadCreationAndPlatformFailures(t *testing.T) {
 	// session 是图片发送测试共用的有效会话。
-	session := Session{AccountID: "acc-1", ChatID: "chat-1", BuyerID: "buyer-1"}
+	session := Session{AccountID: "acc-1", ChatID: "chat-1", PeerUserID: "buyer-1"}
 	// input 是图片发送测试共用的有效输入。
 	input := ImageInput{Session: session, Filename: "a.jpg", ContentType: "image/jpeg", Data: []byte("image")}
 	// unavailable 是缺少图片发送端口的服务。
@@ -320,5 +334,48 @@ func TestSendImageCoversValidationUploadCreationAndPlatformFailures(t *testing.T
 	message, sendErr := senderFailure.SendImage(context.Background(), input)
 	if !errors.Is(sendErr, ErrSend) || message == nil || len(senderFailureRepository.statuses) != 1 || senderFailureRepository.statuses[0] != "failed" {
 		t.Fatalf("message=%+v err=%v statuses=%v", message, sendErr, senderFailureRepository.statuses)
+	}
+}
+
+// TestSendReplyUsesTheMessagePageImagePipeline 验证完整回复的图片和文字都经过消息页面已有发送入口。
+func TestSendReplyUsesTheMessagePageImagePipeline(t *testing.T) {
+	// repository、sender 和 uploader 保存统一发送链路的测试端口。
+	repository, sender := &sendRepository{}, &sendSender{}
+	// uploader 保存平台返回的真实图片地址和像素尺寸。
+	uploader := sendUploader{result: ImageUpload{URL: "https://cdn.example/reply.jpg", Width: 1600, Height: 900}}
+	// service 是同时具备文字、图片上传和完整回复能力的聊天应用服务。
+	service := NewWithSending(nil, repository, sendProvider{sender: sender}, uploader)
+	service.imageDownloader = func(context.Context, string) ([]byte, string, string, error) {
+		return []byte("reply-image"), "image/jpeg", "reply.jpg", nil
+	}
+	// result、sendErr 保存完整回复投递结果及错误。
+	result, sendErr := service.SendReply(context.Background(), ReplyInput{
+		Session: Session{AccountID: "acc-1", ChatID: "chat-1", PeerUserID: "buyer-1"},
+		Text:    "图片随后附上", ImageURL: "https://origin.example/reply.jpg",
+	})
+	if sendErr != nil || result == nil || !result.ImageSent || !result.TextSent || result.Image == nil || result.Text == nil {
+		t.Fatalf("result=%+v err=%v", result, sendErr)
+	}
+	if sender.imageWidth != 1600 || sender.imageHeight != 900 || strings.Join(sender.calls, ",") != "image,text" {
+		t.Fatalf("统一发送顺序或尺寸错误 calls=%v size=%dx%d", sender.calls, sender.imageWidth, sender.imageHeight)
+	}
+}
+
+// TestSendReplyStopsBeforeTextWhenImageDownloadFails 验证图片下载失败时不会旁路发送文字。
+func TestSendReplyStopsBeforeTextWhenImageDownloadFails(t *testing.T) {
+	// sender 保存不应被调用的消息页面发送端口。
+	sender := &sendSender{}
+	// service 是注入下载失败的完整回复服务。
+	service := NewWithSending(nil, &sendRepository{}, sendProvider{sender: sender}, sendUploader{})
+	service.imageDownloader = func(context.Context, string) ([]byte, string, string, error) {
+		return nil, "", "", errors.New("download failed")
+	}
+	// sendErr 保存图片下载失败后统一映射的错误。
+	_, sendErr := service.SendReply(context.Background(), ReplyInput{
+		Session: Session{AccountID: "acc-1", ChatID: "chat-1", PeerUserID: "buyer-1"},
+		Text:    "不应发送", ImageURL: "https://origin.example/fail.jpg",
+	})
+	if !errors.Is(sendErr, ErrSend) || len(sender.calls) != 0 {
+		t.Fatalf("download error=%v calls=%v", sendErr, sender.calls)
 	}
 }

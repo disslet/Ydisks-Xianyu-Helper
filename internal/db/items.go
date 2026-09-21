@@ -46,6 +46,22 @@ func (i *Items) GetByCookieItem(ctx context.Context, cookieID, itemID string) (I
 	return row, nil
 }
 
+// ExistsByCookieItem 判断商品是否曾经属于指定账号；包含软删除记录，供订单归属核验保留已售商品证据。
+func (i *Items) ExistsByCookieItem(ctx context.Context, cookieID, itemID string) (bool, error) {
+	// marker、err 保存商品归属存在性查询结果；不读取商品详情或账号凭证明文。
+	var marker int
+	// err 保存商品归属存在性查询或扫描错误。
+	err := i.DB.QueryRowContext(ctx,
+		`SELECT 1 FROM item_info WHERE cookie_id=? AND item_id=? LIMIT 1`, cookieID, itemID).Scan(&marker)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return marker != 0, nil
+}
+
 // ListForUser 一次查询用户范围内的全部商品，可选按账号 ID 过滤。
 func (i *Items) ListForUser(ctx context.Context, userID int64, cookieID string) ([]ItemInfoRow, error) {
 	// rows、err 保存用户范围商品查询结果及错误。
@@ -225,6 +241,60 @@ func (i *Items) SyncFromRemote(ctx context.Context, cookieID string, rows []Item
 		return ItemSyncResult{}, err
 	}
 	return ItemSyncResult{Saved: len(validRows), Deleted: int(deleted)}, nil
+}
+
+// SavePageFromRemote 在一个事务内保存远端分页商品，确保基础字段和多规格标记不会部分成功。
+func (i *Items) SavePageFromRemote(ctx context.Context, cookieID string, rows []ItemInfoRow) (int, error) {
+	cookieID = strings.TrimSpace(cookieID)
+	if cookieID == "" {
+		return 0, errors.New("cookie_id 不能为空")
+	}
+	// remoteIDs、validRows 保存去重且具有有效商品 ID 的远端分页记录。
+	remoteIDs := make(map[string]struct{}, len(rows))
+	// validRows 保存过滤空 ID 和重复 ID 后的分页商品。
+	validRows := make([]ItemInfoRow, 0, len(rows))
+	// row 表示当前待规范化的远端分页商品记录。
+	for _, row := range rows {
+		row.CookieID = cookieID
+		row.ItemID = strings.TrimSpace(row.ItemID)
+		if row.ItemID == "" {
+			continue
+		}
+		// exists 表示当前商品 ID 是否已经在本页出现过。
+		if _, exists := remoteIDs[row.ItemID]; exists {
+			continue
+		}
+		remoteIDs[row.ItemID] = struct{}{}
+		validRows = append(validRows, row)
+	}
+	// tx、err 保存本页商品原子写入使用的事务及初始化错误。
+	tx, err := i.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	// rollback 统一回滚失败事务并保留原始数据库错误。
+	rollback := func(err error) (int, error) {
+		_ = tx.Rollback()
+		return 0, err
+	}
+	// index 表示当前事务中待写入的规范化商品下标。
+	for index := range validRows {
+		// err 保存当前商品基础字段事务写入错误。
+		if err := i.UpsertBasicTx(ctx, tx, &validRows[index]); err != nil {
+			return rollback(err)
+		}
+		// err 保存当前商品多规格标记事务写入错误。
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE item_info SET is_multi_spec=?, updated_at=CURRENT_TIMESTAMP WHERE cookie_id=? AND item_id=?`,
+			boolToInt(validRows[index].IsMultiSpec), cookieID, validRows[index].ItemID); err != nil {
+			return rollback(err)
+		}
+	}
+	// err 保存本页商品事务提交错误。
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(validRows), nil
 }
 
 // upsertBasic 封装upsertBasic业务协调。

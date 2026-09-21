@@ -665,6 +665,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/chat/items": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 查询个人会话中对方或当前账号的在售商品 */
+        get: operations["getApiV1ChatItems"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chat/item-cards": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 向个人会话发送商品卡片 */
+        post: operations["postApiV1ChatItemCards"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/chat/images": {
         parameters: {
             query?: never;
@@ -781,7 +815,8 @@ export interface paths {
         get: operations["getApiV1ChatSessions"];
         put?: never;
         post?: never;
-        delete?: never;
+        /** deleteApiV1ChatSessions */
+        delete: operations["deleteApiV1ChatSessions"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1193,7 +1228,8 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** getApiV1NotificationsChannelsBychannel_id */
+        get: operations["getApiV1NotificationsChannelsBychannel_id"];
         /** putApiV1NotificationsChannelsBychannel_id */
         put: operations["putApiV1NotificationsChannelsBychannel_id"];
         post?: never;
@@ -1351,7 +1387,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** postApiV1OrdersImport */
+        /**
+         * 人工插入订单已永久移除
+         * @deprecated
+         */
         post: operations["postApiV1OrdersImport"];
         delete?: never;
         options?: never;
@@ -1773,6 +1812,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/settings/ai-test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** postApiV1SettingsAiTest */
+        post: operations["postApiV1SettingsAiTest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/settings/ai-reply": {
         parameters: {
             query?: never;
@@ -2022,6 +2078,7 @@ export interface components {
             trigger_type: string;
             enabled: boolean;
             priority: number;
+            /** @description 规则 JSON 配置；账号级 order_paid 仅在 allow_all_items 为布尔 true 时允许全商品兜底，省略或 false 均不授权。 */
             config_json: string;
             actions: components["schemas"]["AutomationActionRequest"][];
         };
@@ -2053,6 +2110,7 @@ export interface components {
             trigger_type: string;
             enabled: boolean;
             priority: number;
+            /** @description 规则 JSON 配置；账号级 order_paid 仅在 allow_all_items 为布尔 true 时允许全商品兜底，省略或 false 均不授权。 */
             config_json: string;
             /** @enum {string} */
             sku_migration_status: "pending" | "ready" | "needs_reconfiguration";
@@ -2154,11 +2212,24 @@ export interface components {
             id: number;
             keyword: string;
             reply: string;
+            /** @description 关联商品标识的持久化字段；多选时为逗号分隔串，空串表示账号级回复 */
             item_id: string;
+            /** @description 关联商品标识集合；空集合表示账号级回复 */
+            item_ids: string[];
             type: string;
             image_url: string;
         };
         KeywordTypedListResponse: components["schemas"]["KeywordTypedResponse"][];
+        KeywordCreateRequest: {
+            keyword: string;
+            reply: string;
+            /** @description 兼容旧单值调用方；多选时由 item_ids 合并而来 */
+            item_id: string;
+            /** @description 关联商品标识集合；一条规则可关联多个商品，空集合表示账号级回复 */
+            item_ids: string[];
+            type: string;
+            image_url: string;
+        };
         DefaultReplyMapResponse: {
             [key: string]: components["schemas"]["DefaultReplyResponse"];
         };
@@ -2242,7 +2313,21 @@ export interface components {
             postage_mode: string;
             postage: string;
             location?: string;
+            /** @description 可选的闲鱼类目主键 */
+            category_id?: string;
+            /** @description 可选的闲鱼类目名称 */
+            category_name?: string;
+            /** @description 可选的闲鱼频道类目主键 */
+            channel_category_id?: string;
+            /** @description 可选的淘宝类目主键 */
+            tb_category_id?: string;
+            /** @description 可选的闲鱼 itemProperties JSON；多规格时每个维度至少包含两个规格值 */
+            item_properties?: string;
+            /** @description 可选的闲鱼 itemSkuList JSON；多规格时逐行提供价格、库存和 propertyList */
+            item_sku_list?: string;
             images: string[];
+            /** @description 多规格规格值图片，可选 */
+            spec_images?: string[];
         };
         ItemPublishBatchPreviewRow: {
             row_no: number;
@@ -2492,6 +2577,15 @@ export interface components {
             enabled: boolean;
             user_id?: number;
         };
+        NotificationChannelEditorResponse: {
+            id: number;
+            name: string;
+            type: string;
+            event_types?: string;
+            enabled: boolean;
+            to_email?: string;
+            use_custom_smtp?: boolean;
+        };
         NotificationChannelCreateRequest: {
             name: string;
             type: string;
@@ -2503,6 +2597,8 @@ export interface components {
             name?: string;
             type?: string;
             config?: string;
+            /** @description 仅更新已有邮件渠道的收件地址，保留所有 SMTP 配置；与 config 互斥，不可同时改变渠道类型。 */
+            email_recipient?: string;
             event_types?: string;
             enabled?: boolean;
         };
@@ -2577,6 +2673,8 @@ export interface components {
             has_cookie: boolean;
             enabled: boolean;
             auto_confirm: boolean;
+            auto_consign: boolean;
+            auto_bargain: boolean;
             remark: string;
             pause_duration: number;
             paused_until: number;
@@ -2604,6 +2702,8 @@ export interface components {
             cookie?: string;
             remark?: string;
             auto_confirm?: boolean;
+            auto_consign?: boolean;
+            auto_bargain?: boolean;
             pause_duration?: number;
             username?: string;
             login_password?: string;
@@ -2626,9 +2726,12 @@ export interface components {
         };
         AutoConfirmRequest: {
             auto_confirm: boolean;
+            /** @description 自动发货后是否自动确认发货（转已发货）；省略时保持不变 */
+            auto_consign?: boolean;
         };
         AutoConfirmResponse: {
             auto_confirm: boolean;
+            auto_consign: boolean;
         };
         AccountRemarkRequest: {
             remark: string;
@@ -2672,6 +2775,17 @@ export interface components {
         AIModelsResponse: {
             models: string[];
         };
+        AIConnectionTestRequest: {
+            base_url: string;
+            api_key?: string;
+            model?: string;
+        };
+        AIConnectionTestResponse: {
+            success: boolean;
+            model: string;
+            latency_ms: number;
+            reply: string;
+        };
         SecretSettingChange: {
             /** @enum {string} */
             action: "retain" | "replace" | "clear";
@@ -2697,9 +2811,15 @@ export interface components {
         ChatSession: {
             account_id: string;
             chat_id: string;
-            buyer_id: string;
-            buyer_name: string;
-            buyer_avatar_url?: string;
+            peer_user_id: string;
+            peer_name: string;
+            peer_avatar_url?: string;
+            /** @enum {string} */
+            account_role: "seller" | "buyer" | "unknown";
+            buyer_user_id: string;
+            seller_user_id: string;
+            role_item_id: string;
+            role_source: string;
             item_id?: string;
             item_title?: string;
             item_image_url?: string;
@@ -2717,11 +2837,11 @@ export interface components {
             sender_id: string;
             sender_name: string;
             /** @enum {string} */
-            message_type: "text" | "image" | "video" | "audio" | "system";
+            message_type: "text" | "image" | "video" | "audio" | "item" | "system";
             content: string;
             media_duration?: number;
             /** @enum {string} */
-            status: "received" | "sending" | "sent" | "failed";
+            status: "received" | "sending" | "sent" | "failed" | "uncertain";
             read_status?: number;
             read_at?: number;
             sent_at: number;
@@ -2768,11 +2888,35 @@ export interface components {
         ChatMessageRequest: {
             account_id: string;
             chat_id: string;
-            buyer_id: string;
-            buyer_name?: string;
+            peer_user_id: string;
+            peer_name?: string;
             item_id?: string;
             item_title?: string;
             text: string;
+        };
+        ChatItem: {
+            item_id: string;
+            title: string;
+            /** Format: uri */
+            image_url: string;
+            price: string;
+            description?: string;
+        };
+        ChatItemPage: {
+            items: components["schemas"]["ChatItem"][];
+            page: number;
+            has_more: boolean;
+        };
+        ChatItemCardRequest: {
+            account_id: string;
+            chat_id: string;
+            item: components["schemas"]["ChatItemCardSnapshot"];
+        };
+        ChatItemCardSnapshot: {
+            item_id: string;
+            title: string;
+            image_url: string;
+            price: string;
         };
         ChatReadRequest: {
             account_id: string;
@@ -2887,6 +3031,10 @@ export interface components {
             new_status?: string;
         };
         OrderRefreshSummary: {
+            /** @description 同账号软删除订单恢复数，与新增和错绑修正不重复计数；旧任务可省略。 */
+            restored?: number;
+            /** @description 经身份核验修正历史错绑的订单数，与同账号恢复不重复计数；旧任务可省略。 */
+            reassigned?: number;
             discovered: number;
             list_updated: number;
             soft_deleted: number;
@@ -6645,6 +6793,182 @@ export interface operations {
             };
         };
     };
+    getApiV1ChatItems: {
+        parameters: {
+            query: {
+                account_id: string;
+                chat_id: string;
+                role: "peer" | "self";
+                query?: string;
+                page?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatItemPage"];
+                };
+            };
+            /** @description 统一错误响应 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 闲鱼商品查询失败 */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 商品查询能力未装配 */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiV1ChatItemCards: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatItemCardRequest"];
+            };
+        };
+        responses: {
+            /** @description 成功 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatMessageEnvelope"];
+                };
+            };
+            /** @description 统一错误响应 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 账号离线 */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 平台已发送但本地状态收口失败 */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSendErrorResponse"];
+                };
+            };
+            /** @description 平台发送失败 */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSendErrorResponse"];
+                };
+            };
+            /** @description 商品发送能力未装配 */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     postApiV1ChatImages: {
         parameters: {
             query?: never;
@@ -6657,9 +6981,9 @@ export interface operations {
                 "multipart/form-data": {
                     account_id: string;
                     chat_id: string;
-                    buyer_id: string;
-                    buyer_name?: string;
-                    buyer_avatar_url?: string;
+                    peer_user_id: string;
+                    peer_name?: string;
+                    peer_avatar_url?: string;
                     item_id?: string;
                     item_title?: string;
                     /** Format: binary */
@@ -7340,6 +7664,83 @@ export interface operations {
             };
             /** @description 平台联系人刷新失败 */
             502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    deleteApiV1ChatSessions: {
+        parameters: {
+            query: {
+                account_id: string;
+                chat_id: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OperationResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -9431,6 +9832,73 @@ export interface operations {
             };
         };
     };
+    getApiV1NotificationsChannelsBychannel_id: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                channel_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotificationChannelEditorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     putApiV1NotificationsChannelsBychannel_id: {
         parameters: {
             query?: never;
@@ -10250,25 +10718,8 @@ export interface operations {
             path?: never;
             cookie?: never;
         };
-        requestBody: {
-            content: {
-                "multipart/form-data": {
-                    /** Format: binary */
-                    file?: string;
-                };
-                "application/json": components["schemas"]["OrderUpdateRequest"][];
-            };
-        };
+        requestBody?: never;
         responses: {
-            /** @description 成功 */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["OrderBatchResponse"];
-                };
-            };
             /** @description 统一错误响应 */
             400: {
                 headers: {
@@ -10278,7 +10729,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
-            /** @description 统一错误响应 */
+            /** @description 未登录 */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -10287,26 +10738,8 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
-            /** @description 统一错误响应 */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorResponse"];
-                };
-            };
-            /** @description 统一错误响应 */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorResponse"];
-                };
-            };
-            /** @description 统一错误响应 */
-            500: {
+            /** @description 人工插入订单已移除，请使用订单同步 */
+            501: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -11340,7 +11773,11 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["KeywordCreateRequest"];
+            };
+        };
         responses: {
             /** @description 成功 */
             200: {
@@ -11475,7 +11912,11 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["KeywordCreateRequest"];
+            };
+        };
         responses: {
             /** @description 成功 */
             200: {
@@ -12340,6 +12781,84 @@ export interface operations {
             };
             /** @description 统一错误响应 */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiV1SettingsAiTest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AIConnectionTestRequest"];
+            };
+        };
+        responses: {
+            /** @description 成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AIConnectionTestResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description 统一错误响应 */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description AI 上游服务或连接测试失败的统一错误响应 */
+            502: {
                 headers: {
                     [name: string]: unknown;
                 };

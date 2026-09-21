@@ -29,6 +29,8 @@ type chatHandlerCoveragePort struct {
 	ownsAccountErr    error
 	// cleanupErr 保存清理空会话要返回的错误。
 	cleanupErr error
+	// deleteConversationErr 保存会话删除应用用例要返回的错误。
+	deleteConversationErr error
 	// refreshConversationsPage 与 refreshConversationsErr 保存联系人刷新结果。
 	refreshConversationsPage chatapp.ConversationPage
 	refreshConversationsErr  error
@@ -70,6 +72,8 @@ type cookieSettingsCoveragePort struct {
 	// updateSettingsResult 与 updateSettingsErr 保存账号设置更新结果。
 	updateSettingsResult accountapp.SettingsResult
 	updateSettingsErr    error
+	// updateSettingsInput 保存最近一次账号设置请求，验证多个开关由同一应用服务调用提交。
+	updateSettingsInput accountapp.SettingsUpdateInput
 	// loginInfoErr 保存登录资料更新错误。
 	loginInfoErr error
 	// statusResult 与 statusErr 保存账号启停结果。
@@ -108,8 +112,9 @@ func (port *cookieLoginCoveragePort) UpdateCookie(context.Context, string, strin
 	return port.updateErr
 }
 
-// UpdateSettings 返回测试配置的账号设置更新结果。
-func (port *cookieSettingsCoveragePort) UpdateSettings(context.Context, accountapp.SettingsUpdateInput) (accountapp.SettingsResult, error) {
+// UpdateSettings 返回测试配置的账号设置更新结果，并记录本次输入以验证事务边界。
+func (port *cookieSettingsCoveragePort) UpdateSettings(_ context.Context, input accountapp.SettingsUpdateInput) (accountapp.SettingsResult, error) {
+	port.updateSettingsInput = input
 	return port.updateSettingsResult, port.updateSettingsErr
 }
 
@@ -152,6 +157,11 @@ func (port *chatHandlerCoveragePort) ImageUploadAvailable() bool { return port.i
 // OwnsAccount 返回测试配置的账号归属结果。
 func (port *chatHandlerCoveragePort) OwnsAccount(context.Context, int64, string) (bool, error) {
 	return port.ownsAccountResult, port.ownsAccountErr
+}
+
+// DeleteConversation 返回测试配置的会话删除错误。
+func (port *chatHandlerCoveragePort) DeleteConversation(context.Context, int64, string, string) error {
+	return port.deleteConversationErr
 }
 
 // CleanupEmptySessions 返回测试配置的空会话清理错误。
@@ -254,7 +264,7 @@ func TestChatSendTextHandlerCoversAvailabilityValidationAndErrors(t *testing.T) 
 	// cookie 是通过真实登录流程取得的管理员会话。
 	cookie := loginHelper(t, handler)
 	// successRecorder 保存文字发送成功响应。
-	successRecorder := serveChatCoverageRequest(handler, cookie, http.MethodPost, "/api/v1/chat/messages", `{"account_id":"acc1","chat_id":"chat1","buyer_id":"buyer1","text":"你好"}`)
+	successRecorder := serveChatCoverageRequest(handler, cookie, http.MethodPost, "/api/v1/chat/messages", `{"account_id":"acc1","chat_id":"chat1","peer_user_id":"buyer1","text":"你好"}`)
 	if successRecorder.Code != http.StatusCreated {
 		t.Fatalf("success status=%d body=%s", successRecorder.Code, successRecorder.Body.String())
 	}
@@ -267,6 +277,7 @@ func TestChatSendTextHandlerCoversAvailabilityValidationAndErrors(t *testing.T) 
 		{"unavailable", chatapp.ErrUnavailable, http.StatusServiceUnavailable},
 		{"offline", chatapp.ErrOffline, http.StatusConflict},
 		{"send", chatapp.ErrSend, http.StatusBadGateway},
+		{"uncertain", chatapp.ErrSendUncertain, http.StatusBadGateway},
 		{"status save", chatapp.ErrStatusSave, http.StatusInternalServerError},
 		{"other", errors.New("send failed"), http.StatusInternalServerError},
 	}
@@ -274,7 +285,10 @@ func TestChatSendTextHandlerCoversAvailabilityValidationAndErrors(t *testing.T) 
 	for _, errorCase := range errorCases {
 		port.sendTextErr = errorCase.err
 		// recorder 保存当前文字发送错误响应。
-		recorder := serveChatCoverageRequest(handler, cookie, http.MethodPost, "/api/v1/chat/messages", `{"account_id":"acc1","chat_id":"chat1","buyer_id":"buyer1","text":"你好"}`)
+		recorder := serveChatCoverageRequest(handler, cookie, http.MethodPost, "/api/v1/chat/messages", `{"account_id":"acc1","chat_id":"chat1","peer_user_id":"buyer1","text":"你好"}`)
+		if errors.Is(errorCase.err, chatapp.ErrSendUncertain) || errors.Is(errorCase.err, chatapp.ErrSend) {
+			assertOutgoingErrorDTO(t, recorder, "acc1", "chat1")
+		}
 		if recorder.Code != errorCase.status {
 			t.Errorf("%s status=%d want=%d body=%s", errorCase.name, recorder.Code, errorCase.status, recorder.Body.String())
 		}
@@ -288,8 +302,8 @@ func TestChatSendTextHandlerCoversAvailabilityValidationAndErrors(t *testing.T) 
 		status int
 	}{
 		{"malformed json", "{", http.StatusBadRequest},
-		{"missing fields", `{"account_id":"acc1","chat_id":"","buyer_id":"buyer1","text":"x"}`, http.StatusBadRequest},
-		{"too long", `{"account_id":"acc1","chat_id":"chat1","buyer_id":"buyer1","text":"` + strings.Repeat("中", 2001) + `"}`, http.StatusBadRequest},
+		{"missing fields", `{"account_id":"acc1","chat_id":"","peer_user_id":"buyer1","text":"x"}`, http.StatusBadRequest},
+		{"too long", `{"account_id":"acc1","chat_id":"chat1","peer_user_id":"buyer1","text":"` + strings.Repeat("中", 2001) + `"}`, http.StatusBadRequest},
 	}
 	// validationCase 表示当前文字发送输入校验场景。
 	for _, validationCase := range validationCases {
@@ -301,7 +315,7 @@ func TestChatSendTextHandlerCoversAvailabilityValidationAndErrors(t *testing.T) 
 	}
 	port.ownsAccountResult = false
 	// forbiddenRecorder 保存账号归属失败响应。
-	forbiddenRecorder := serveChatCoverageRequest(handler, cookie, http.MethodPost, "/api/v1/chat/messages", `{"account_id":"acc1","chat_id":"chat1","buyer_id":"buyer1","text":"你好"}`)
+	forbiddenRecorder := serveChatCoverageRequest(handler, cookie, http.MethodPost, "/api/v1/chat/messages", `{"account_id":"acc1","chat_id":"chat1","peer_user_id":"buyer1","text":"你好"}`)
 	if forbiddenRecorder.Code != http.StatusForbidden {
 		t.Fatalf("forbidden status=%d", forbiddenRecorder.Code)
 	}
@@ -322,7 +336,7 @@ func newChatImageCoverageRequest(t *testing.T, cookie *http.Cookie, fileContentT
 	writer := multipart.NewWriter(&body)
 	if includeFields {
 		// fields 保存图片发送所需的聊天标识字段。
-		fields := map[string]string{"account_id": "acc1", "chat_id": "chat1", "buyer_id": "buyer1"}
+		fields := map[string]string{"account_id": "acc1", "chat_id": "chat1", "peer_user_id": "buyer1"}
 		// fieldName、fieldValue 表示当前待写入的表单字段。
 		for fieldName, fieldValue := range fields {
 			// fieldErr 表示当前表单字段写入失败原因。
@@ -398,6 +412,7 @@ func TestChatSendImageHandlerCoversValidationAndErrors(t *testing.T) {
 		{"unavailable", chatapp.ErrUnavailable, http.StatusServiceUnavailable},
 		{"offline", chatapp.ErrOffline, http.StatusConflict},
 		{"send", chatapp.ErrSend, http.StatusBadGateway},
+		{"uncertain", chatapp.ErrSendUncertain, http.StatusBadGateway},
 		{"status save", chatapp.ErrStatusSave, http.StatusInternalServerError},
 		{"other", errors.New("image failed"), http.StatusInternalServerError},
 	}
@@ -409,6 +424,9 @@ func TestChatSendImageHandlerCoversValidationAndErrors(t *testing.T) {
 		// recorder 保存当前图片发送错误响应。
 		recorder := httptest.NewRecorder()
 		handler.ServeHTTP(recorder, request)
+		if errors.Is(errorCase.err, chatapp.ErrSendUncertain) || errors.Is(errorCase.err, chatapp.ErrSend) {
+			assertOutgoingErrorDTO(t, recorder, "acc1", "chat1")
+		}
 		if recorder.Code != errorCase.status {
 			t.Errorf("%s status=%d want=%d body=%s", errorCase.name, recorder.Code, errorCase.status, recorder.Body.String())
 		}
@@ -484,12 +502,12 @@ func TestChatSessionAndMessageHandlersCoverRefreshFallbacks(t *testing.T) {
 	// port 是当前测试注入的会话与消息应用端口。
 	port := &chatHandlerCoveragePort{
 		ownsAccountResult:        true,
-		listSessionsResult:       []chatapp.Session{{AccountID: "acc1", ChatID: "chat1", BuyerID: "buyer1", BuyerName: "买家"}},
-		refreshIdentitiesResult:  []chatapp.Session{{AccountID: "acc1", ChatID: "chat1", BuyerID: "buyer1", BuyerName: "补全买家"}},
+		listSessionsResult:       []chatapp.Session{{AccountID: "acc1", ChatID: "chat1", PeerUserID: "buyer1", PeerName: "买家"}},
+		refreshIdentitiesResult:  []chatapp.Session{{AccountID: "acc1", ChatID: "chat1", PeerUserID: "buyer1", PeerName: "补全买家"}},
 		refreshConversationsPage: chatapp.ConversationPage{HasMore: true, NextCursor: 9},
-		refreshHistoryPage:       chatapp.HistoryPage{Session: chatapp.Session{AccountID: "acc1", ChatID: "chat1", BuyerID: "buyer1"}, HasMore: true, NextCursor: 10},
-		listStoredPage:           chatapp.Page{Session: chatapp.Session{AccountID: "acc1", ChatID: "chat1", BuyerID: "buyer1"}},
-		resolveIdentityResult:    chatapp.Session{AccountID: "acc1", ChatID: "chat1", BuyerID: "buyer1", BuyerName: "本地补全"},
+		refreshHistoryPage:       chatapp.HistoryPage{Session: chatapp.Session{AccountID: "acc1", ChatID: "chat1", PeerUserID: "buyer1"}, HasMore: true, NextCursor: 10},
+		listStoredPage:           chatapp.Page{Session: chatapp.Session{AccountID: "acc1", ChatID: "chat1", PeerUserID: "buyer1"}},
+		resolveIdentityResult:    chatapp.Session{AccountID: "acc1", ChatID: "chat1", PeerUserID: "buyer1", PeerName: "本地补全"},
 	}
 	srv.applications.chat = port
 	// handler 是注入可控聊天端口后的真实路由。
@@ -587,6 +605,52 @@ func TestChatSessionAndMessageHandlersCoverRefreshFallbacks(t *testing.T) {
 	}
 }
 
+// TestDeleteChatSessionHandlerMapsApplicationResults 覆盖本地会话删除的成功与统一错误契约。
+func TestDeleteChatSessionHandlerMapsApplicationResults(t *testing.T) {
+	// srv、cleanup 是启用聊天应用的测试服务及资源释放函数。
+	srv, _, cleanup := newTestServerWithChat(t)
+	defer cleanup()
+	// port 是当前测试注入的可控会话删除应用端口。
+	port := &chatHandlerCoveragePort{}
+	srv.applications.chat = port
+	// handler 是注入可控聊天端口后的真实路由。
+	handler := srv.Router()
+	// cookie 是通过真实登录流程取得的管理员会话。
+	cookie := loginHelper(t, handler)
+	// cases 保存应用错误与 HTTP 状态、稳定错误码之间的映射断言。
+	cases := []struct {
+		// name 是子场景名称。
+		name string
+		// appErr 是应用端口返回值。
+		appErr error
+		// wantStatus 是预期 HTTP 状态。
+		wantStatus int
+		// wantCode 是预期统一错误码，成功时为空。
+		wantCode string
+	}{
+		{name: "success", wantStatus: http.StatusOK},
+		{name: "invalid", appErr: chatapp.ErrInvalidInput, wantStatus: http.StatusBadRequest, wantCode: "chat_session_invalid"},
+		{name: "forbidden", appErr: chatapp.ErrSessionForbidden, wantStatus: http.StatusForbidden, wantCode: "chat_session_forbidden"},
+		{name: "not-found", appErr: chatapp.ErrChatSessionNotFound, wantStatus: http.StatusNotFound, wantCode: "chat_session_not_found"},
+		{name: "unavailable", appErr: chatapp.ErrSessionUnavailable, wantStatus: http.StatusServiceUnavailable, wantCode: "chat_session_service_unavailable"},
+		{name: "storage", appErr: errors.New("storage failed"), wantStatus: http.StatusInternalServerError, wantCode: "chat_session_delete_failed"},
+	}
+	// testCase 是当前待执行的错误映射场景。
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			port.deleteConversationErr = testCase.appErr
+			// recorder 保存本次真实 DELETE 路由响应。
+			recorder := serveChatCoverageRequest(handler, cookie, http.MethodDelete, "/api/v1/chat/sessions?account_id=acc1&chat_id=chat1", "")
+			if recorder.Code != testCase.wantStatus {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			if testCase.wantCode != "" && !strings.Contains(recorder.Body.String(), `"code":"`+testCase.wantCode+`"`) {
+				t.Fatalf("body=%s", recorder.Body.String())
+			}
+		})
+	}
+}
+
 // TestMarkChatReadHandlerCoversValidationAndErrorBranches 覆盖聊天已读 handler 的本地提交与平台上报分支。
 func TestMarkChatReadHandlerCoversValidationAndErrorBranches(t *testing.T) {
 	// srv、cleanup 是启用聊天应用的测试服务及资源释放函数。
@@ -677,7 +741,7 @@ func TestCookieSettingsHandlersCoverStatusUpdateAndValidation(t *testing.T) {
 		body   string
 	}{
 		{http.MethodPut, "/api/v1/cookies/acc1/status", `{"enabled":true}`},
-		{http.MethodPut, "/api/v1/cookies/acc1/auto-confirm", `{"auto_confirm":true}`},
+		{http.MethodPut, "/api/v1/cookies/acc1/auto-confirm", `{"auto_confirm":true,"auto_consign":false}`},
 		{http.MethodPut, "/api/v1/cookies/acc1/remark", `{"remark":"备注"}`},
 		{http.MethodPut, "/api/v1/cookies/acc1/pause-duration", `{"pause_duration":30}`},
 		{http.MethodGet, "/api/v1/cookies/acc1/pause-duration", ""},
@@ -690,6 +754,14 @@ func TestCookieSettingsHandlersCoverStatusUpdateAndValidation(t *testing.T) {
 		recorder := serveChatCoverageRequest(handler, cookie, successCase.method, successCase.path, successCase.body)
 		if recorder.Code != http.StatusOK {
 			t.Errorf("%s %s status=%d body=%s", successCase.method, successCase.path, recorder.Code, recorder.Body.String())
+		}
+		if successCase.path == "/api/v1/cookies/acc1/auto-confirm" {
+			if port.updateSettingsInput.AutoConfirm == nil || !*port.updateSettingsInput.AutoConfirm {
+				t.Fatal("自动发货开关应通过聚合设置提交")
+			}
+			if port.updateSettingsInput.AutoConsign == nil || *port.updateSettingsInput.AutoConsign {
+				t.Fatal("自动确认发货开关应与自动发货开关一并提交")
+			}
 		}
 	}
 
@@ -778,19 +850,19 @@ func TestCookieSettingsHandlersCoverStatusUpdateAndValidation(t *testing.T) {
 		}
 	}
 
-	port.autoConfirmErr = accountapp.ErrForbidden
+	port.updateSettingsErr = accountapp.ErrForbidden
 	// autoConfirmErrorRecorder 保存自动确认无权错误响应。
 	autoConfirmErrorRecorder := serveChatCoverageRequest(handler, cookie, http.MethodPut, "/api/v1/cookies/acc1/auto-confirm", `{"auto_confirm":true}`)
 	if autoConfirmErrorRecorder.Code != http.StatusForbidden {
 		t.Fatalf("auto confirm status=%d", autoConfirmErrorRecorder.Code)
 	}
-	port.autoConfirmErr = errors.New("auto confirm failed")
+	port.updateSettingsErr = errors.New("auto confirm failed")
 	// autoConfirmInternalRecorder 保存自动确认内部错误响应。
 	autoConfirmInternalRecorder := serveChatCoverageRequest(handler, cookie, http.MethodPut, "/api/v1/cookies/acc1/auto-confirm", `{"auto_confirm":true}`)
 	if autoConfirmInternalRecorder.Code != http.StatusInternalServerError {
 		t.Fatalf("auto confirm internal status=%d", autoConfirmInternalRecorder.Code)
 	}
-	port.autoConfirmErr = nil
+	port.updateSettingsErr = nil
 	port.remarkErr = accountapp.ErrNotFound
 	// remarkErrorRecorder 保存备注账号不存在响应。
 	remarkErrorRecorder := serveChatCoverageRequest(handler, cookie, http.MethodPut, "/api/v1/cookies/acc1/remark", `{"remark":"x"}`)

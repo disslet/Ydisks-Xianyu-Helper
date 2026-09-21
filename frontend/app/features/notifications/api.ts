@@ -1,7 +1,8 @@
-import type { MutationIDResponse,NotificationBinding,NotificationChannel,NotificationChannelResponse,NotificationEventType,OperationResponse,SystemSettings } from './models';
+import type { MutationIDResponse,NotificationBinding,NotificationChannel,NotificationChannelEditorResponse,NotificationChannelResponse,NotificationEventType,OperationResponse,SystemSettings } from './models';
 import { normalizeSystemSettingsUpdate } from '../../../shared/api-contract/settings';
 import { type RequestControlOptions } from '../../../shared/http/client';
 import { contractClient, runContractRequest } from '../../../shared/api-contract/client';
+import { normalizeNotificationEventTypes } from './models';
 export type * from './models';
 
 /** 通知渠道写入时使用的具名请求 DTO。 */
@@ -12,6 +13,8 @@ export interface NotificationChannelRequest {
   type?: string;
   /** 由各渠道表单构造的非敏感配置。 */
   config?: Record<string, unknown>;
+  /** 仅修改邮件收件地址，保留已有 SMTP；与 config 互斥。 */
+  email_recipient?: string;
   /** 需要订阅的系统事件。 */
   event_types?: NotificationEventType[];
   /** 渠道是否参与通知投递。 */
@@ -20,16 +23,16 @@ export interface NotificationChannelRequest {
 
 /** 将后端字符串或历史分隔文本转换为稳定事件类型列表。 */
 const parseNotificationEventTypes = (raw: unknown): NotificationEventType[] => {
-  if (Array.isArray(raw)) return raw.filter(Boolean) as NotificationEventType[];
+  if (Array.isArray(raw)) return normalizeNotificationEventTypes(raw.filter(Boolean) as NotificationEventType[]);
   if (typeof raw !== 'string' || !raw.trim()) return [];
   try {
     // parsed 是解析后的历史 JSON 事件列表。
     const parsed: unknown = JSON.parse(raw);
-    if (Array.isArray(parsed)) return parsed.filter(Boolean) as NotificationEventType[];
+    if (Array.isArray(parsed)) return normalizeNotificationEventTypes(parsed.filter(Boolean) as NotificationEventType[]);
   } catch {
     // 非 JSON 历史值继续按分隔符兼容解析。
   }
-  return raw.split(/[,\s;]+/).map(value => value.trim()).filter(Boolean) as NotificationEventType[];
+  return normalizeNotificationEventTypes(raw.split(/[,\s;]+/).map(value => value.trim()).filter(Boolean) as NotificationEventType[]);
 };
 
 /** 将事件类型列表序列化为后端稳定保存的 JSON 文本。 */
@@ -55,6 +58,9 @@ export const getNotificationChannels = async (options?: RequestControlOptions): 
   return { success: true, data: response.map(toNotificationChannel) };
 };
 
+/** 获取单个通知渠道编辑所需的脱敏配置。 */
+export const getNotificationChannel = async (channelID: string, options?: RequestControlOptions): Promise<NotificationChannelEditorResponse> => runContractRequest(/* signal 控制通知渠道编辑配置读取的取消和超时。 */ signal => contractClient.GET('/api/v1/notifications/channels/{channel_id}', { params: { path: { channel_id: channelID } }, signal }), options);
+
 /** 创建通知渠道，并在传输边界序列化配置与事件。 */
 export const createNotificationChannel = async (data: Required<Pick<NotificationChannelRequest, 'name' | 'type' | 'config'>> & NotificationChannelRequest, options?: RequestControlOptions): Promise<MutationIDResponse> => runContractRequest(/* signal 控制通知渠道创建请求的取消和超时。 */ signal => contractClient.POST('/api/v1/notifications/channels', { body: { name: data.name, type: data.type, config: JSON.stringify(data.config), event_types: stringifyNotificationEventTypes(data.event_types), enabled: data.enabled }, signal }), options);
 
@@ -65,6 +71,7 @@ export const updateNotificationChannel = async (channelID: string, data: Notific
     name: data.name,
     type: data.type,
     config: data.config === undefined ? undefined : JSON.stringify(data.config),
+    email_recipient: data.email_recipient,
     event_types: data.event_types === undefined ? undefined : stringifyNotificationEventTypes(data.event_types),
     enabled: data.enabled,
   };

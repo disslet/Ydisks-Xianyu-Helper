@@ -49,10 +49,14 @@ type OrderRuntimeHooks struct {
 	UpdateRunningCookie func(context.Context, string, string)
 	// NotifyDelivery 发送手动发货结果通知。
 	NotifyDelivery func(string, string, string, string, string)
-	// RecoverExpiredSession 处理平台会话过期。
+	// RecoverExpiredSession 处理平台明确的 Session 过期；MTOP Token 刷新由请求客户端负责。
 	RecoverExpiredSession func(context.Context, string, error) bool
 	// ReportPersistenceFailure 记录本地订单状态写入失败。
 	ReportPersistenceFailure func(string, error)
+	// RefreshChatConversations 按需刷新指定账号的聊天联系人缓存；未装配时订单同步保持可用但不补关联。
+	RefreshChatConversations func(context.Context, string) error
+	// OrderDetails 是订单刷新与自动发货共享的详情限流协调器；构造后不可替换。
+	OrderDetails *OrderDetailCoordinator
 }
 
 // NewOrderRuntimeHooks 将账号、自动化和通知依赖转换为订单运行时回调；闭包只存在于 adapter 装配边界。
@@ -88,6 +92,8 @@ type OrderRuntime struct {
 	reconciliation orderapp.ReconciliationRecorder
 	// logger 记录不含凭证的订单持久化错误。
 	logger *slog.Logger
+	// orderDetails 统一限制管理端订单刷新对同一账号发出的详情请求，并与自动发货复用在途请求。
+	orderDetails *OrderDetailCoordinator
 }
 
 // NewOrderRuntime 构造订单平台与运行时适配器。
@@ -97,7 +103,12 @@ func NewOrderRuntime(store *db.Store, hooks OrderRuntimeHooks, reconciliation or
 	if resolvedLogger == nil {
 		resolvedLogger = slog.Default()
 	}
-	return &OrderRuntime{store: store, hooks: hooks, reconciliation: reconciliation, logger: resolvedLogger}
+	// orderDetails 是构造期固定的详情协调器；隔离测试未注入时保留独立默认实例。
+	orderDetails := hooks.OrderDetails
+	if orderDetails == nil {
+		orderDetails = NewOrderDetailCoordinator(resolvedLogger)
+	}
+	return &OrderRuntime{store: store, hooks: hooks, reconciliation: reconciliation, logger: resolvedLogger, orderDetails: orderDetails}
 }
 
 // AccountRunning 判断指定账号是否在线运行。
@@ -143,22 +154,25 @@ func (r *OrderRuntime) consignWithCurrentCookie(ctx context.Context, cookieID, o
 	if r == nil || r.store == nil || r.store.Cookies == nil {
 		return false, nil, "", false, errors.New("订单凭证存储未初始化")
 	}
-	// unlock 保护当前账号凭证读取和写回，保持现有订单流程的串行语义。
+	// unlock 保护当前账号凭证读取；平台确认发货开始前必须释放账号锁。
 	unlock := r.store.LockAccountCredentials(cookieID)
-	defer unlock()
 	// detail、loadErr 保存按账号读取的平台运行凭证及错误。
 	detail, loadErr := r.store.Cookies.GetCookiePlatformRuntimeData(ctx, cookieID)
 	if loadErr != nil {
+		unlock()
 		return false, nil, "", false, loadErr
 	}
 	if detail.UserID != userID {
+		unlock()
 		return false, nil, "", false, orderapp.ErrForbidden
 	}
 	if !hasStoredOrderCredential(detail) {
+		unlock()
 		return false, nil, "", false, errors.New("账号 Cookie 为空")
 	}
 	// requestCtx、session 保存带 Cookie 快照的平台上下文及响应会话。
 	requestCtx, session := withOrderCookieSnapshot(ctx, detail)
+	unlock()
 	// client 保存当前平台调用客户端。
 	client := r.mtopClient()
 	if client == nil {
@@ -167,7 +181,7 @@ func (r *OrderRuntime) consignWithCurrentCookie(ctx context.Context, cookieID, o
 	// success、messages、updatedCookies、callErr 保存平台确认发货响应。
 	success, messages, updatedCookies, callErr := client.ConsignContext(requestCtx, detail.Value, orderID)
 	// value、valueChanged、handled、persistErr 保存响应 Cookie 会话写回结果。
-	value, valueChanged, handled, persistErr := r.persistOrderCookieSession(ctx, detail, session, updatedCookies)
+	value, valueChanged, handled, persistErr := r.persistCurrentOrderCookieSession(ctx, detail, session, updatedCookies, userID)
 	if persistErr != nil {
 		// wrappedPersistErr 保存包含订单语义的 Cookie 写回错误。
 		wrappedPersistErr := fmt.Errorf("保存发货响应 Cookie Jar: %w", persistErr)
@@ -187,14 +201,7 @@ func (r *OrderRuntime) consignWithCurrentCookie(ctx context.Context, cookieID, o
 	if callErr != nil {
 		return false, messages, "", false, callErr
 	}
-	if updatedCookies == "" || updatedCookies == detail.Value {
-		return success, messages, "", false, nil
-	}
-	// err 保存旧式平面 Cookie 写回错误。
-	if err := r.store.Cookies.UpdateValueOwned(ctx, cookieID, updatedCookies, userID); err != nil {
-		return success, messages, "", false, fmt.Errorf("保存发货响应 Cookie: %w", err)
-	}
-	return success, messages, updatedCookies, true, nil
+	return success, messages, "", false, nil
 }
 
 // UpdateRunningCookie 同步运行时账号 Cookie。
@@ -275,8 +282,8 @@ func (r *OrderRuntime) FetchOrderDetail(ctx context.Context, detail *orderapp.Pl
 	}
 	// requestCtx、session 保存带 Cookie 快照的平台上下文及响应会话。
 	requestCtx, session := withOrderCookieSnapshot(ctx, platformRuntimeDataForOrder(detail))
-	// result、callErr 保存平台详情响应和错误。
-	result, callErr := fetcher.FetchOrderDetail(requestCtx, detail.Value, orderID)
+	// result、callErr 保存共享限流和同订单去重后的平台详情响应及错误。
+	result, callErr := r.orderDetails.Fetch(requestCtx, detail.ID, orderID, detail.Value, fetcher)
 	// cookieUpdate 保存平台详情请求观察到的 Cookie 会话变化。
 	cookieUpdate := orderCookieUpdate(detail, session)
 	if callErr != nil {
@@ -288,10 +295,14 @@ func (r *OrderRuntime) FetchOrderDetail(ctx context.Context, detail *orderapp.Pl
 	return orderapp.RefreshDetailFetchResult{Detail: &orderapp.RefreshDetail{Quantity: result.Quantity, SpecName: result.SpecName, SpecValue: result.SpecValue, OrderStatus: result.OrderStatus, Amount: result.Amount, UpdatedCookies: result.UpdatedCookies}, CookieUpdate: cookieUpdate}, nil
 }
 
-// FetchSoldOrders 调用平台已售订单接口并收集 Cookie 会话变化。
+// FetchSoldOrders 用 r 已装配的客户端按 ctx 取消信号读取 detail 对应账号的全部已售订单。
+// detail 中的明文凭证只用于平台请求；返回值保留已抓订单和 Cookie 更新，只有分页完整结束才返回 nil 错误。
+// SellerID 仅声明每页实际请求共同使用的 unb，缺失时为空；身份冲突及中途失败均不得用于落库或软删除。
 func (r *OrderRuntime) FetchSoldOrders(ctx context.Context, detail *orderapp.PlatformRuntimeData) (orderapp.RefreshSoldFetchResult, error) {
+	// client 固定本次同步的平台客户端，身份检查与分页调用使用同一实例。
+	client := r.mtopClient()
 	// fetcher、available 保存订单列表接口实现及其可用状态。
-	fetcher, available := r.mtopClient().(mtop.SoldOrderFetcher)
+	fetcher, available := client.(mtop.SoldOrderFetcher)
 	if !available {
 		return orderapp.RefreshSoldFetchResult{}, errors.New("当前 MTop 客户端不支持订单列表发现")
 	}
@@ -302,8 +313,23 @@ func (r *OrderRuntime) FetchSoldOrders(ctx context.Context, detail *orderapp.Pla
 	requestCtx, session := withOrderCookieSnapshot(ctx, platformRuntimeDataForOrder(detail))
 	// orders 保存跨分页累积的平台订单。
 	orders := make([]orderapp.RefreshSoldOrder, 0)
+	// sellerID 保存已观察到的请求 UID，identityComplete 要求每一页都具备可验证的相同身份。
+	sellerID, identityComplete := "", true
 	// pageNumber 是当前请求的订单列表页码。
 	for pageNumber := 1; pageNumber <= orderRuntimeMaxSoldOrderPages; pageNumber++ {
+		// requestSellerID、identityErr 根据当前请求 URL 的 Cookie 作用域校验身份，响应更新不反推本页身份。
+		requestSellerID, identityErr := soldOrderRequestSellerID(client, detail.Value, session)
+		if identityErr != nil {
+			return orderapp.RefreshSoldFetchResult{Orders: orders, CookieUpdate: orderCookieUpdate(detail, session)}, identityErr
+		}
+		if requestSellerID == "" {
+			identityComplete = false
+		} else {
+			if sellerID != "" && requestSellerID != sellerID {
+				return orderapp.RefreshSoldFetchResult{Orders: orders, CookieUpdate: orderCookieUpdate(detail, session)}, errors.New("订单列表分页请求身份发生变化")
+			}
+			sellerID = requestSellerID
+		}
 		// page、callErr 保存当前订单列表页及错误。
 		page, callErr := fetcher.FetchSoldOrdersPage(requestCtx, detail.Value, pageNumber, 30)
 		if callErr != nil {
@@ -314,13 +340,81 @@ func (r *OrderRuntime) FetchSoldOrders(ctx context.Context, detail *orderapp.Pla
 		}
 		// remote 是当前平台订单列表项。
 		for _, remote := range page.Items {
+			if strings.TrimSpace(remote.OrderID) == "" {
+				return orderapp.RefreshSoldFetchResult{Orders: orders, CookieUpdate: orderCookieUpdate(detail, session)}, fmt.Errorf("订单列表第 %d 页存在缺失订单号的条目，分页不完整", pageNumber)
+			}
 			orders = append(orders, orderapp.RefreshSoldOrder{OrderID: remote.OrderID, ItemID: remote.ItemID, BuyerID: remote.BuyerID, CreatedAt: remote.CreatedAt, OrderStatus: orderapp.NormalizeOrderStatus(remote.OrderStatus), Quantity: remote.Quantity, Amount: remote.Amount, ReceiverName: remote.ReceiverName, ReceiverPhone: remote.ReceiverPhone, ReceiverAddr: remote.ReceiverAddr, ReceiverCity: remote.ReceiverCity, IsBargain: remote.IsBargain})
 		}
-		if !page.NextPage || len(page.Items) == 0 {
-			break
+		if !page.NextPage {
+			if !identityComplete {
+				sellerID = ""
+			}
+			return orderapp.RefreshSoldFetchResult{SellerID: sellerID, Orders: orders, CookieUpdate: orderCookieUpdate(detail, session)}, nil
+		}
+		if len(page.Items) == 0 {
+			return orderapp.RefreshSoldFetchResult{Orders: orders, CookieUpdate: orderCookieUpdate(detail, session)}, fmt.Errorf("订单列表第 %d 页为空页但 nextPage 为真，分页不完整", pageNumber)
 		}
 	}
-	return orderapp.RefreshSoldFetchResult{Orders: orders, CookieUpdate: orderCookieUpdate(detail, session)}, nil
+	return orderapp.RefreshSoldFetchResult{Orders: orders, CookieUpdate: orderCookieUpdate(detail, session)}, fmt.Errorf("订单列表达到 %d 页上限但 nextPage 为真，分页不完整", orderRuntimeMaxSoldOrderPages)
+}
+
+// RefreshChatConversations 按需刷新订单同步所需的聊天联系人缓存。
+func (r *OrderRuntime) RefreshChatConversations(ctx context.Context, cookieID string) error {
+	if r == nil || r.hooks.RefreshChatConversations == nil {
+		return nil
+	}
+	return r.hooks.RefreshChatConversations(ctx, cookieID)
+}
+
+// soldOrderRequestSellerID 从 client 本次已售请求对应的 session 读取非敏感 unb，fallback 仅用于检查旧扁平凭证冲突。
+// 完整 Jar 必须按实际端点筛选，不能以 State 的 /im 视图或 fallback 冒充实际请求身份；错误不含 UID 或凭证。
+func soldOrderRequestSellerID(client mtop.Client, fallback string, session *mtop.CookieSession) (string, error) {
+	// endpoint 与标准已售客户端采用相同默认值，替身遵循同一平台请求契约。
+	endpoint := mtop.SoldOrdersAPI
+	// configured、ok 识别实际客户端的可配置端点，确保本地或代理地址使用自身 Cookie 作用域。
+	if configured, ok := client.(*mtop.ClientImpl); ok && configured != nil && configured.SoldOrdersURL != "" {
+		endpoint = configured.SoldOrdersURL
+	}
+	// requestCookies、snapshot 保存会话平面值及完整 Jar；凭证只在当前函数内用于身份提取，禁止输出。
+	requestCookies, snapshot, _ := session.State()
+	if snapshot != nil {
+		requestCookies, _ = cookierefresh.ScopedCookieHeaderForRequest(snapshot, endpoint, "https://goofish.com", time.Now())
+	}
+	// sellerID、requestErr 保存实际请求 UID 和重复身份冲突，不读取买家字段推断卖家。
+	sellerID, requestErr := soldOrderCookieUID(requestCookies)
+	if requestErr != nil {
+		return "", requestErr
+	}
+	// fallbackID、fallbackErr 保存兼容凭证中的 UID 和歧义错误，不能用于补齐 Jar 缺失的 UID。
+	fallbackID, fallbackErr := soldOrderCookieUID(fallback)
+	if fallbackErr != nil {
+		return "", fallbackErr
+	}
+	if sellerID != "" && fallbackID != "" && sellerID != fallbackID {
+		return "", errors.New("订单列表请求 Cookie 会话与扁平凭证身份冲突")
+	}
+	return sellerID, nil
+}
+
+// soldOrderCookieUID 只从 header 的 unb 提取非敏感平台 UID；重复且不同的值返回脱敏错误，不改变 Cookie 合并规则。
+func soldOrderCookieUID(header string) (string, error) {
+	// sellerID 保存当前 UID，found 记录是否出现过 unb，防止空值与非空重复项被误当作单一身份。
+	sellerID, found := "", false
+	// part 是当前 Cookie 键值片段，内容仅用于比较，禁止输出。
+	for _, part := range strings.Split(header, ";") {
+		// name、value、present 保存 Cookie 名、值及是否有等号；仅关注名称严格为 unb 的片段。
+		name, value, present := strings.Cut(strings.TrimSpace(part), "=")
+		if !present || strings.TrimSpace(name) != "unb" {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if found && sellerID != value {
+			return "", errors.New("订单列表请求 Cookie 存在多个冲突身份")
+		}
+		sellerID = value
+		found = true
+	}
+	return sellerID, nil
 }
 
 // PersistCookieSession 在凭证锁内保存应用层 Cookie 更新。
@@ -342,7 +436,7 @@ func (r *OrderRuntime) PersistCookieSession(ctx context.Context, detail *orderap
 	return update.Value, update.Value != detail.Value, true, nil
 }
 
-// IsSessionExpired 判断平台错误是否为会话过期。
+// IsSessionExpired 判断 err 是否明确表示 Session 失效；r 的订单刷新调用不得把 Token 失效升级为账号恢复。
 func (r *OrderRuntime) IsSessionExpired(err error) bool {
 	return mtop.IsSessionExpiredErr(err)
 }
@@ -414,6 +508,37 @@ func (r *OrderRuntime) persistOrderCookieSession(ctx context.Context, detail db.
 		return value, value != detail.Value, true, persistErr
 	}
 	return value, value != detail.Value, true, nil
+}
+
+// persistCurrentOrderCookieSession 在写回响应前重新校验凭证版本，避免旧发货响应覆盖新登录状态。
+func (r *OrderRuntime) persistCurrentOrderCookieSession(ctx context.Context, detail db.CookiePlatformRuntimeData, session *mtop.CookieSession, updatedCookies string, userID int64) (string, bool, bool, error) {
+	if r == nil || r.store == nil || r.store.Cookies == nil {
+		return "", false, false, errors.New("账号 Cookie 持久化 repository 未初始化")
+	}
+	// unlock 保护平台响应完成后的凭证复核和条件写回，锁内不执行外部 I/O。
+	unlock := r.store.LockAccountCredentials(detail.ID)
+	defer unlock()
+	// latest、loadErr 保存平台调用完成后的当前账号凭证视图及读取错误。
+	latest, loadErr := r.store.Cookies.GetCookiePlatformRuntimeData(ctx, detail.ID)
+	if loadErr != nil {
+		return "", false, false, loadErr
+	}
+	if latest.UserID != userID || latest.UserID != detail.UserID || latest.Value != detail.Value || latest.MetadataJSON != detail.MetadataJSON {
+		return "", false, false, errors.New("账号凭证已变化，请重试")
+	}
+	// value、valueChanged、handled、persistErr 保存同一凭证版本的完整会话写回结果。
+	value, valueChanged, handled, persistErr := r.persistOrderCookieSession(ctx, latest, session, updatedCookies)
+	if persistErr != nil {
+		return value, valueChanged, handled, persistErr
+	}
+	if handled || strings.TrimSpace(updatedCookies) == "" || updatedCookies == latest.Value {
+		return value, valueChanged, handled, nil
+	}
+	// persistErr 保存旧版平台只返回扁平 Cookie 时的条件写回错误。
+	if persistErr := r.store.Cookies.UpdateValueOwned(ctx, detail.ID, updatedCookies, userID); persistErr != nil {
+		return "", false, false, persistErr
+	}
+	return updatedCookies, true, true, nil
 }
 
 // orderRuntimeMaxSoldOrderPages 限制一次订单发现最多请求的平台页数。

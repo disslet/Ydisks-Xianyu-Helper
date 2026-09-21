@@ -110,6 +110,21 @@ describe('useRuleActions', /* 当前回调验证规则页面动作协调器的�
     hook.unmount();
   });
 
+  test('账号通用授权随保存保留，切换商品后要求重新确认', /* 当前回调验证旧规则默认未授权、显式授权保存和范围切换撤销。 */ async () => {
+    // hook 是带真实表单状态的规则动作协调器。
+    const hook = renderHook(/* 当前回调构建隔离的规则编辑状态。 */ () => useRuleActionsHarness());
+    act(/* 当前回调打开尚未授权的新规则。 */ () => hook.result.current.openNewAutomationRule());
+    expect(hook.result.current.reviewConfig.allow_all_items).not.toBe(true);
+    act(/* 当前回调模拟用户明确确认内容适用于当前账号的全部商品。 */ () => hook.result.current.setEditingAutomationRule(/* draft 是编辑器当前表单。 */ draft => ({ ...draft, config_json: '{"allow_all_items":true}', variants: [{ id: 'variant', spec_name: '', spec_value: '', card_id: 7, delivery_count: 1, enabled: true }] })));
+    await act(/* 当前回调保存用户明确授权的通用规则。 */ async () => hook.result.current.handleSaveAutomationRule());
+    expect(updateShippingMock).toHaveBeenCalledWith(expect.objectContaining({ config_json: '{"allow_all_items":true}' }));
+    act(/* 当前回调切换为商品专属范围，撤销旧通用授权。 */ () => hook.result.current.handleAutomationItemChange('item-1'));
+    expect(hook.result.current.reviewConfig.allow_all_items).toBe(false);
+    act(/* 当前回调再改回账号范围，仍必须重新勾选。 */ () => hook.result.current.handleAutomationItemChange(''));
+    expect(hook.result.current.reviewConfig.allow_all_items).toBe(false);
+    hook.unmount();
+  });
+
   test('拍下改价规则校验目标价格并剔除空提醒动作', /* 当前回调验证拍下改价草稿与保存边界。 */ async () => {
     // hook 是规则动作 Hook 的真实 React 状态实例。
     const hook = renderHook(() => useRuleActionsHarness());
@@ -190,6 +205,54 @@ describe('useRuleActions', /* 当前回调验证规则页面动作协调器的�
     expect(deleteReplyMock).toHaveBeenCalledWith('reply-1', 'account-1');
     expect(deleteDefaultMock).toHaveBeenCalledWith('account-1');
     expect(clearRecordsMock).toHaveBeenCalledWith('account-1');
+    hook.unmount();
+  });
+
+  test('关键词回复保存与删除使用轻提示而不是原生弹窗', /* 当前回调验证回复规则操作的轻提示反馈。 */ async () => {
+    // hook 是规则动作 Hook 的真实 React 状态实例。
+    const hook = renderHook(() => useRuleActionsHarness());
+    act(/* 当前回调打开关键词新增弹窗。 */ () => hook.result.current.handleAddReplyRule());
+    expect(hook.result.current.editingReplyRule?.item_ids).toEqual([]);
+    act(/* 当前回调填写关键词回复草稿。 */ () => hook.result.current.setEditingReplyRule(/* currentDraft 更新关键词回复草稿。 */ current => ({ ...current, keyword: '你好', reply_content: '您好' })));
+    await act(/* 当前回调保存关键词回复规则。 */ async () => hook.result.current.handleSaveReplyRule());
+    expect(hook.result.current.toast).toEqual({ type: 'success', text: '保存成功' });
+
+    await act(/* 当前回调删除单条关键词回复规则。 */ async () => hook.result.current.handleDeleteReply('reply-1'));
+    expect(hook.result.current.toast).toEqual({ type: 'success', text: '删除成功' });
+    hook.unmount();
+  });
+
+  test('关键词回复校验失败时用错误轻提示且不触达接口', /* 当前回调验证输入校验的轻提示反馈。 */ async () => {
+    // hook 是规则动作 Hook 的真实 React 状态实例。
+    const hook = renderHook(() => useRuleActionsHarness());
+    act(/* 当前回调打开关键词新增弹窗但保持空草稿。 */ () => hook.result.current.handleAddReplyRule());
+    await act(/* 当前回调保存缺内容的空草稿。 */ async () => hook.result.current.handleSaveReplyRule());
+    expect(updateReplyMock).not.toHaveBeenCalled();
+    expect(hook.result.current.toast).toEqual({ type: 'error', text: '请填写关键词和回复内容' });
+    hook.unmount();
+  });
+
+  test('未选择账号时新增关键词回复给出错误轻提示', /* 当前回调验证缺少账号时的输入反馈。 */ () => {
+    // hook 是规则动作 Hook 的真实 React 状态实例。
+    const hook = renderHook(/* 当前回调构建无账号的规则动作状态。 */ () => {
+      // options 复用默认依赖但把当前账号置空。
+      const options = { selectedAccountId: '', setSelectedAccountId: vi.fn(), setActiveTab: vi.fn(), items: [], setAutomationRules: vi.fn(), setCards: vi.fn(), setItems: vi.fn(), setLoading: vi.fn(), loadAutomationRules: vi.fn(async () => undefined /* 自动化刷新替身。 */), loadReferenceData: vi.fn(async () => undefined /* 参考数据刷新替身。 */), loadReplyRules: vi.fn(async () => undefined /* 关键词刷新替身。 */), loadDefaultReplies: vi.fn(async () => undefined /* 默认回复刷新替身。 */) } as RuleActionsOptions;
+      return useRuleActions(options);
+    });
+    act(/* 当前回调在没有账号时尝试新增关键词回复。 */ () => hook.result.current.handleAddReplyRule());
+    expect(hook.result.current.showReplyModal).toBe(false);
+    expect(hook.result.current.toast).toEqual({ type: 'error', text: '请先选择账号' });
+    hook.unmount();
+  });
+
+  test('关键词回复保存失败时透出错误轻提示', /* 当前回调验证接口失败的轻提示反馈。 */ async () => {
+    updateReplyMock.mockRejectedValueOnce(new Error('网络异常'));
+    // hook 是规则动作 Hook 的真实 React 状态实例。
+    const hook = renderHook(() => useRuleActionsHarness());
+    act(/* 当前回调打开关键词新增弹窗。 */ () => hook.result.current.handleAddReplyRule());
+    act(/* 当前回调填写关键词回复草稿。 */ () => hook.result.current.setEditingReplyRule(/* currentDraft 更新关键词回复草稿。 */ current => ({ ...current, keyword: '你好', reply_content: '您好' })));
+    await act(/* 当前回调保存会失败的回复规则。 */ async () => hook.result.current.handleSaveReplyRule());
+    expect(hook.result.current.toast).toEqual({ type: 'error', text: '保存失败：网络异常' });
     hook.unmount();
   });
 });

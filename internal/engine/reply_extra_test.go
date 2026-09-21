@@ -6,7 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"xianyu-go/internal/automation"
 	"xianyu-go/internal/db"
+	"xianyu-go/internal/xianyu/ws"
 )
 
 // fakeAPIReplier 可控的 API 回复 mock：返回预设结果或错误。
@@ -41,6 +43,59 @@ type recordingSender struct {
 	images   []imageSent
 	textErr  error
 	imageErr error
+	// textCalls 统计文本发送尝试次数，包含返回错误的传输调用。
+	textCalls int
+	// beforeTextError 在文本发送返回错误前执行，用于模拟发送过程中取消请求上下文。
+	beforeTextError func()
+}
+
+// SendReply 复现聊天应用的图片先发、文字后发顺序，供回复状态测试使用。
+func (r *recordingSender) SendReply(ctx context.Context, message ReplyMessage) (ReplySendResult, error) {
+	// result 保存已成功完成的平台分段。
+	result := ReplySendResult{}
+	if message.ImageURL != "" {
+		// imageErr 保存图片分段发送结果。
+		if imageErr := r.SendImage(ctx, message.ChatID, message.ToUserID, message.ImageURL, 0, 0, 0); imageErr != nil {
+			result.Uncertain = replySendUncertain(imageErr)
+			return result, imageErr
+		}
+		result.ImageSent = true
+	}
+	if message.Text != "" {
+		// textErr 保存文字分段发送结果。
+		if textErr := r.SendText(ctx, message.ChatID, message.ToUserID, message.Text); textErr != nil {
+			result.Uncertain = replySendUncertain(textErr)
+			return result, textErr
+		}
+		result.TextSent = true
+	}
+	return result, nil
+}
+
+// replySendUncertain 复现聊天应用对测试发送错误的确定性分类；普通本地错误和明确未发送错误都允许重试。
+func replySendUncertain(err error) bool {
+	if err == nil || errors.Is(err, automation.ErrMessageNotSent) {
+		return false
+	}
+	// sendErr 保存可由协议层明确标记为不确定的发送错误。
+	var sendErr *ws.SendError
+	return errors.As(err, &sendErr) && ws.SendResultKind(err) == ws.SendUncertain
+}
+
+// recordingReplyDelivery 记录引擎交给聊天应用的完整回复，不模拟任何协议级图片尺寸逻辑。
+type recordingReplyDelivery struct {
+	// messages 保存完整回复消息及其字段。
+	messages []ReplyMessage
+	// result 保存聊天应用返回的分段确认结果。
+	result ReplySendResult
+	// err 保存聊天应用返回的发送错误。
+	err error
+}
+
+// SendReply 记录完整回复并返回预设的应用层发送结果。
+func (d *recordingReplyDelivery) SendReply(_ context.Context, message ReplyMessage) (ReplySendResult, error) {
+	d.messages = append(d.messages, message)
+	return d.result, d.err
 }
 
 // textSent 用于本次流程后续判断的文本Sent
@@ -52,10 +107,16 @@ type textSent struct {
 type imageSent struct {
 	chatID, toUserID, url string
 	cardID                int64
+	// width 和 height 保存交给 WebSocket 的图片像素尺寸。
+	width, height int
 }
 
 // SendText 封装Send文本业务协调。
 func (r *recordingSender) SendText(_ context.Context, chatID, toUserID, text string) error {
+	r.textCalls++
+	if r.beforeTextError != nil {
+		r.beforeTextError()
+	}
 	if r.textErr != nil {
 		return r.textErr
 	}
@@ -63,12 +124,45 @@ func (r *recordingSender) SendText(_ context.Context, chatID, toUserID, text str
 	return nil
 }
 
-// SendImage 封装Send图片业务协调。
-func (r *recordingSender) SendImage(_ context.Context, chatID, toUserID, url string, cardID int64, _, _ int) error {
+// TestReplyOnceMarksDefiniteFailureWithIndependentContext 验证取消发送上下文时确定未发送状态仍可被领取重试。
+func TestReplyOnceMarksDefiniteFailureWithIndependentContext(t *testing.T) {
+	// store、cleanup 保存隔离数据库及关闭责任。
+	store, cleanup := newReplyStore(t)
+	defer cleanup()
+	// setupErr 保存启用一次性默认回复的配置写入错误。
+	if setupErr := store.DefaultReps.Upsert(context.Background(), "cid", db.DefaultReply{Enabled: true, ReplyOnce: true, ReplyContent: "欢迎"}); setupErr != nil {
+		t.Fatal(setupErr)
+	}
+	// requestCtx、cancel 保存会在发送失败期间被取消的原始请求上下文。
+	requestCtx, cancel := context.WithCancel(context.Background())
+	// sender 模拟确定未发送错误，并在返回前取消原始请求上下文。
+	sender := &recordingSender{textErr: automation.ErrMessageNotSent, beforeTextError: cancel}
+	// service 使用真实状态仓储验证失败状态可恢复。
+	service := NewReplyService("cid", store, sender, nil, nil, nil)
+	// sendErr 保存确定未发送错误的回复结果。
+	if sendErr := service.Handle(requestCtx, chatMsg("你好", "", "chat-definite-failure")); !errors.Is(sendErr, automation.ErrMessageNotSent) {
+		t.Fatalf("确定未发送错误未透传: %v", sendErr)
+	}
+	// record、recordErr 保存第一次失败后的状态。
+	record, recordErr := store.DefaultReps.Record(context.Background(), "cid", "chat-definite-failure")
+	if recordErr != nil || record.Status != "failed" {
+		t.Fatalf("取消上下文不应遗留 sending 状态 record=%+v err=%v", record, recordErr)
+	}
+	// sender 恢复成功发送，验证 failed 记录可被下一次请求重新领取。
+	sender.textErr = nil
+	// retryErr 保存重新领取失败状态后的回复结果。
+	if retryErr := service.Handle(context.Background(), chatMsg("还在吗", "", "chat-definite-failure")); retryErr != nil || sender.textCalls != 2 {
+		t.Fatalf("失败状态无法重新领取 retryErr=%v calls=%d", retryErr, sender.textCalls)
+	}
+}
+
+// SendImage 记录聊天图片地址、关联卡密和像素尺寸，供回复投递测试断言。
+// ctx 是发送上下文；chatID/toUserID/url/cardID 标识消息身份；width/height 是发送协议中的图片像素尺寸。
+func (r *recordingSender) SendImage(_ context.Context, chatID, toUserID, url string, cardID int64, width, height int) error {
 	if r.imageErr != nil {
 		return r.imageErr
 	}
-	r.images = append(r.images, imageSent{chatID, toUserID, url, cardID})
+	r.images = append(r.images, imageSent{chatID: chatID, toUserID: toUserID, url: url, cardID: cardID, width: width, height: height})
 	return nil
 }
 
@@ -149,6 +243,121 @@ func TestReplyOnceRetriesOnlyFailedParts(t *testing.T) {
 	record, err = s.DefaultReps.Record(ctx, "cid", "chat-retry")
 	if err != nil || record.Status != "sent" || !record.ImageSent || !record.TextSent {
 		t.Fatalf("sent record=%+v err=%v", record, err)
+	}
+}
+
+// TestReplyOnceQuarantinesUncertainSend 验证平台可能已送达时不允许一次性默认回复自动重发。
+func TestReplyOnceQuarantinesUncertainSend(t *testing.T) {
+	// store、cleanup 保存隔离数据库及其关闭责任。
+	store, cleanup := newReplyStore(t)
+	defer cleanup()
+	// ctx 是默认回复配置和发送状态读写使用的无截止上下文。
+	ctx := context.Background()
+	// setupErr 保存启用一次性默认回复的配置写入错误。
+	setupErr := store.DefaultReps.Upsert(ctx, "cid", db.DefaultReply{Enabled: true, ReplyOnce: true, ReplyContent: "欢迎"})
+	if setupErr != nil {
+		t.Fatal(setupErr)
+	}
+	// sender 模拟平台连接在发送后断开，无法判断消息是否已经送达。
+	sender := &recordingSender{textErr: &ws.SendError{Kind: ws.SendUncertain}}
+	// service 使用真实投递记录存储验证不确定结果隔离。
+	service := NewReplyService("cid", store, sender, nil, nil, nil)
+	// firstErr 保存首次发送返回的不确定错误。
+	firstErr := service.Handle(ctx, chatMsg("你好", "", "chat-uncertain"))
+	if firstErr == nil {
+		t.Fatal("不确定发送结果必须返回调用错误")
+	}
+	// secondErr 保存同一会话再次触发时的结果；它不应发出第二条消息。
+	secondErr := service.Handle(ctx, chatMsg("还在吗", "", "chat-uncertain"))
+	if secondErr != nil || sender.textCalls != 1 {
+		t.Fatalf("不确定结果后不应重发 secondErr=%v calls=%d", secondErr, sender.textCalls)
+	}
+	// record、recordErr 保存最终隔离状态及查询错误。
+	record, recordErr := store.DefaultReps.Record(ctx, "cid", "chat-uncertain")
+	if recordErr != nil || record.Status != "uncertain" {
+		t.Fatalf("不确定回复未隔离 record=%+v err=%v", record, recordErr)
+	}
+}
+
+// TestReplyOnceQuarantinesWhenUncertainStateIsRejected 验证 uncertain 状态被数据库约束拒绝时，降级隔离仍阻止租约重发。
+func TestReplyOnceQuarantinesWhenUncertainStateIsRejected(t *testing.T) {
+	// store、cleanup 保存隔离数据库及其关闭责任。
+	store, cleanup := newReplyStore(t)
+	defer cleanup()
+	// ctx 是默认回复配置、发送状态和租约更新共用的无截止上下文。
+	ctx := context.Background()
+	// setupErr 保存启用一次性默认回复的配置写入错误。
+	if setupErr := store.DefaultReps.Upsert(ctx, "cid", db.DefaultReply{Enabled: true, ReplyOnce: true, ReplyContent: "欢迎"}); setupErr != nil {
+		t.Fatal(setupErr)
+	}
+	// triggerErr 模拟数据库拒绝直接进入 uncertain 状态的约束错误。
+	if _, triggerErr := store.DB.ExecContext(ctx, `CREATE TRIGGER deny_uncertain_status BEFORE UPDATE OF status ON default_reply_records WHEN NEW.status='uncertain' BEGIN SELECT RAISE(FAIL,'fixture rejection'); END`); triggerErr != nil {
+		t.Fatal(triggerErr)
+	}
+	// sender 让平台返回可能已送达的未知结果。
+	sender := &recordingSender{textErr: &ws.SendError{Kind: ws.SendUncertain}}
+	// service 使用真实投递记录存储验证降级隔离。
+	service := NewReplyService("cid", store, sender, nil, nil, nil)
+	// firstErr 保存首次发送返回的不确定错误。
+	if firstErr := service.Handle(ctx, chatMsg("你好", "", "chat-uncertain-fallback")); firstErr == nil {
+		t.Fatal("不确定发送结果必须返回调用错误")
+	}
+	// expireErr 保存租约到期模拟更新结果。
+	if _, expireErr := store.DB.ExecContext(ctx, `UPDATE default_reply_records SET lease_expires_at=0 WHERE cookie_id=? AND chat_id=?`, "cid", "chat-uncertain-fallback"); expireErr != nil {
+		t.Fatal(expireErr)
+	}
+	// secondErr 保存同一会话再次触发时的结果；降级隔离记录不应再次发送。
+	secondErr := service.Handle(ctx, chatMsg("还在吗", "", "chat-uncertain-fallback"))
+	if secondErr != nil || sender.textCalls != 1 {
+		t.Fatalf("降级隔离后不应重发 secondErr=%v calls=%d", secondErr, sender.textCalls)
+	}
+	// record、recordErr 保存降级隔离后的记录状态及查询错误。
+	record, recordErr := store.DefaultReps.Record(ctx, "cid", "chat-uncertain-fallback")
+	if recordErr != nil || record.Status != "pending" {
+		t.Fatalf("降级隔离记录状态异常 record=%+v err=%v", record, recordErr)
+	}
+}
+
+// TestReplyOnceDoesNotReclaimWhenUncertainPersistenceFails 验证未知结果的两次状态写入都失败时仍不会自动重发。
+func TestReplyOnceDoesNotReclaimWhenUncertainPersistenceFails(t *testing.T) {
+	// store、cleanup 保存隔离数据库及其关闭责任。
+	store, cleanup := newReplyStore(t)
+	defer cleanup()
+	// ctx 是默认回复配置、发送状态和租约更新共用的无截止上下文。
+	ctx := context.Background()
+	// setupErr 保存启用一次性默认回复的配置写入错误。
+	if setupErr := store.DefaultReps.Upsert(ctx, "cid", db.DefaultReply{Enabled: true, ReplyOnce: true, ReplyContent: "欢迎"}); setupErr != nil {
+		t.Fatal(setupErr)
+	}
+	// triggerErr 模拟数据库在未知结果写入期间完全拒绝状态更新。
+	if _, triggerErr := store.DB.ExecContext(ctx, `CREATE TRIGGER deny_reply_state_updates BEFORE UPDATE ON default_reply_records BEGIN SELECT RAISE(FAIL,'fixture write failure'); END`); triggerErr != nil {
+		t.Fatal(triggerErr)
+	}
+	// sender 模拟平台可能已经送达但连接返回未知结果。
+	sender := &recordingSender{textErr: &ws.SendError{Kind: ws.SendUncertain}}
+	// service 使用真实投递记录存储验证 sending 状态的持久化保护。
+	service := NewReplyService("cid", store, sender, nil, nil, nil)
+	// firstErr 保存首次发送返回的不确定错误。
+	if firstErr := service.Handle(ctx, chatMsg("你好", "", "chat-uncertain-db-down")); firstErr == nil {
+		t.Fatal("不确定发送结果必须返回调用错误")
+	}
+	// dropErr 恢复租约更新能力，模拟数据库恢复后再次收到同一会话消息。
+	if _, dropErr := store.DB.ExecContext(ctx, `DROP TRIGGER deny_reply_state_updates`); dropErr != nil {
+		t.Fatal(dropErr)
+	}
+	// expireErr 模拟原领取租约已过期。
+	if _, expireErr := store.DB.ExecContext(ctx, `UPDATE default_reply_records SET lease_expires_at=0 WHERE cookie_id=? AND chat_id=?`, "cid", "chat-uncertain-db-down"); expireErr != nil {
+		t.Fatal(expireErr)
+	}
+	// secondErr 保存数据库恢复后的再次处理结果；sending 记录不得触发第二次外部发送。
+	secondErr := service.Handle(ctx, chatMsg("还在吗", "", "chat-uncertain-db-down"))
+	if secondErr != nil || sender.textCalls != 1 {
+		t.Fatalf("数据库写入失败后不应重发 secondErr=%v calls=%d", secondErr, sender.textCalls)
+	}
+	// record、recordErr 保存仍需人工核对的发送状态及读取错误。
+	record, recordErr := store.DefaultReps.Record(ctx, "cid", "chat-uncertain-db-down")
+	if recordErr != nil || record.Status != "sending" {
+		t.Fatalf("未知结果状态不应回到可重试 pending record=%+v err=%v", record, recordErr)
 	}
 }
 
@@ -240,7 +449,7 @@ func TestReply_ImageKeyword(t *testing.T) {
 	}
 }
 
-// TestReply_HandleSendsImageThenText Handle 先发图片后发文本；Skip 不发送。
+// TestReply_HandleSendsImageThenText 验证 Handle 通过完整消息端口先发图片后发文本，且 Skip 不发送；t 管理本测试。
 func TestReply_HandleSendsImageThenText(t *testing.T) {
 	// s、cleanup 用于本次流程后续判断的s、cleanup
 	s, cleanup := newReplyStore(t)
@@ -257,7 +466,7 @@ func TestReply_HandleSendsImageThenText(t *testing.T) {
 	err := r.Handle(ctx, chatMsg("在吗", "", "chat9")); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
-	if len(sender.images) != 1 || sender.images[0].url != "http://img/y.png" {
+	if len(sender.images) != 1 || sender.images[0].url != "http://img/y.png" || sender.images[0].width != 0 || sender.images[0].height != 0 {
 		t.Fatalf("应先发图片，got %+v", sender.images)
 	}
 	if len(sender.texts) != 1 || sender.texts[0].text != "文字" {
@@ -276,6 +485,63 @@ func TestReply_HandleSendsImageThenText(t *testing.T) {
 	}
 	if len(sender2.texts) != 0 || len(sender2.images) != 0 {
 		t.Fatalf("Skip 不应发送，got texts=%+v images=%+v", sender2.texts, sender2.images)
+	}
+}
+
+// TestReply_HandleDelegatesImageURLWithoutDimensionProbe 验证图片 URL 原样交给完整消息端口而不在引擎读取尺寸；t 管理本测试。
+func TestReply_HandleDelegatesImageURLWithoutDimensionProbe(t *testing.T) {
+	// store 和 cleanup 保存当前测试独占的回复数据库及关闭责任。
+	store, cleanup := newReplyStore(t)
+	defer cleanup()
+	// ctx 是当前测试回复读取和投递使用的无截止上下文。
+	ctx := context.Background()
+	// setupErr 保存图片关键词回复配置写入结果。
+	_, setupErr := store.DB.ExecContext(ctx, `INSERT INTO keywords (cookie_id,keyword,reply,image_url,type) VALUES ('cid','照片','','https://images.example/photo.png','image')`)
+	if setupErr != nil {
+		t.Fatal(setupErr)
+	}
+	// sender 记录完整消息端口收到的图片地址和尺寸占位。
+	sender := &recordingSender{}
+	// reply 使用统一完整消息端口发送图片，不配置任何引擎级尺寸解析器。
+	reply := NewReplyService("cid", store, sender, nil, nil, nil)
+	// sendErr 保存完整消息发送结果。
+	if sendErr := reply.Handle(ctx, chatMsg("给我照片", "", "chat-image-dimensions-fallback")); sendErr != nil {
+		t.Fatalf("图片回复不应被引擎尺寸解析阻断: %v", sendErr)
+	}
+	if len(sender.images) != 1 || sender.images[0].width != 0 || sender.images[0].height != 0 {
+		t.Fatalf("引擎不应自行设置图片尺寸，实际发送=%+v", sender.images)
+	}
+}
+
+// TestReply_HandleDelegatesCompleteMessageToChatDelivery 验证自动回复只生成完整消息并交给聊天应用统一发送。
+func TestReply_HandleDelegatesCompleteMessageToChatDelivery(t *testing.T) {
+	// store、cleanup 保存一次性默认回复状态的隔离数据库。
+	store, cleanup := newReplyStore(t)
+	defer cleanup()
+	// setupErr 保存完整图片文字默认回复的配置写入结果。
+	if setupErr := store.DefaultReps.Upsert(context.Background(), "cid", db.DefaultReply{Enabled: true, ReplyOnce: true, ReplyContent: "文字", ReplyImageURL: "https://origin.example/reply.jpg"}); setupErr != nil {
+		t.Fatal(setupErr)
+	}
+	// delivery 记录引擎提交的完整消息，并模拟两个分段都已由平台确认。
+	delivery := &recordingReplyDelivery{result: ReplySendResult{ImageSent: true, TextSent: true}}
+	// reply 使用生产构造路径，不能访问旧版直接发送器或自动回复尺寸探测器。
+	reply := NewReplyService("cid", store, delivery, nil, nil, nil)
+	// sendErr 保存统一聊天应用发送结果。
+	if sendErr := reply.Handle(context.Background(), chatMsg("你好", "", "chat-complete")); sendErr != nil {
+		t.Fatalf("Handle: %v", sendErr)
+	}
+	if len(delivery.messages) != 1 {
+		t.Fatalf("完整回复调用次数=%d", len(delivery.messages))
+	}
+	// message 是交给消息页面的完整图片文字回复，原始 URL 不应携带猜测尺寸。
+	message := delivery.messages[0]
+	if message.AccountID != "cid" || message.ChatID != "chat-complete" || message.ToUserID != "buyer1" || message.Text != "文字" || message.ImageURL != "https://origin.example/reply.jpg" {
+		t.Fatalf("完整回复内容错误=%+v", message)
+	}
+	// record、recordErr 保存聊天应用成功后的一次性分段状态。
+	record, recordErr := store.DefaultReps.Record(context.Background(), "cid", "chat-complete")
+	if recordErr != nil || record.Status != "sent" || !record.ImageSent || !record.TextSent {
+		t.Fatalf("reply_once 状态错误 record=%+v err=%v", record, recordErr)
 	}
 }
 
@@ -325,6 +591,14 @@ func TestExtractMessageID(t *testing.T) {
 	got := extractMessageID(map[string]any{"1": map[string]any{}}); got != "" {
 		t.Errorf("无 ID: got %q", got)
 	}
+	if // got 用于本次流程后续判断的got
+	got := extractMessageID(map[string]any{"1": map[string]any{"10": map[string]any{"extJson": `{"messageId":"legacy-uuid"}`, "nested": map[string]any{"messageId": "4269999999999.PNM"}}}}); got != "4269999999999.PNM" {
+		t.Errorf("嵌套 PNM 优先: got %q", got)
+	}
+	if // got 用于本次流程后续判断的got
+	got := extractMessageID(map[string]any{"1": map[string]any{"10": map[string]any{"payload": `{"messageId":"4270000000000.PNM"}`}}}); got != "4270000000000.PNM" {
+		t.Errorf("JSON 字符串中的 PNM: got %q", got)
+	}
 }
 
 // TestMessageContentType extJson 优先，其次 m6.3.4，再其次 m6.3.5 内嵌 JSON。
@@ -363,6 +637,12 @@ func TestIsNonUserChatNotice(t *testing.T) {
 	}
 	if !isNonUserChatNotice(map[string]any{}, map[string]any{"extJson": `{"contentType":"26"}`}, "[卡片]") {
 		t.Error("contentType=26 应判为系统提示")
+	}
+	if !isNonUserChatNotice(map[string]any{}, map[string]any{"extJson": `{"contentType":"25"}`}, "快给ta一个评价吧～") {
+		t.Error("contentType=25 评价提醒应判为系统提示")
+	}
+	if !isNonUserChatNotice(map[string]any{}, map[string]any{}, "快给ta一个评价吧～") {
+		t.Error("评价提醒文案即使缺少扩展字段也不应进入聊天回复")
 	}
 	if isNonUserChatNotice(map[string]any{}, map[string]any{}, "[买家说你好]") {
 		t.Error("普通消息不应判为系统提示")

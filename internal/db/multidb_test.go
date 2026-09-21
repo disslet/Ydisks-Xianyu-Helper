@@ -327,7 +327,7 @@ func TestSplitExternalTargetURLDoesNotEchoSecrets(t *testing.T) {
 	}
 }
 
-// TestMultiDB_CookiesUpsertBool 验证 cookie UPSERT + auto_confirm 布尔读写跨三库一致。
+// TestMultiDB_CookiesUpsertBool 验证 cookie UPSERT 及两个自动化开关的布尔读写跨三库一致。
 func TestMultiDB_CookiesUpsertBool(t *testing.T) {
 	// tg 表示当前遍历过程中的tg
 	for _, tg := range allTestTargets(t) {
@@ -365,6 +365,36 @@ func TestMultiDB_CookiesUpsertBool(t *testing.T) {
 			// auto_confirm 默认 true，关闭后读 false。
 			if enabled, err := s.Cookies.GetAutoConfirm(ctx, cid); err != nil || !enabled {
 				t.Fatalf("default auto_confirm=%v err=%v want true", enabled, err)
+			}
+			// consignEnabled、consignErr 验证三方言新增开关的默认关闭语义。
+			consignEnabled, consignErr := s.Cookies.GetAutoConsign(ctx, cid)
+			if consignErr != nil || consignEnabled {
+				t.Fatalf("default auto_consign=%v err=%v want false", consignEnabled, consignErr)
+			}
+			// autoConsignUpdate 验证三方言账号设置更新可以开启平台确认发货动作。
+			autoConsignUpdate := true
+			// updateErr 表示当前数据库方言写入自动确认发货开关时的错误。
+			if _, updateErr := s.Cookies.UpdateSettings(ctx, cid, AccountSettingsUpdate{UserID: user.ID, AutoConsign: &autoConsignUpdate}); updateErr != nil {
+				t.Fatalf("enable auto_consign: %v", updateErr)
+			}
+			// consignEnabled、consignErr 验证显式开启后能从当前数据库方言读回新开关。
+			if consignEnabled, consignErr := s.Cookies.GetAutoConsign(ctx, cid); consignErr != nil || !consignEnabled {
+				t.Fatalf("enabled auto_consign=%v err=%v want true", consignEnabled, consignErr)
+			}
+			// bargainEnabled、bargainErr 验证三方言独立自动免拼开关默认关闭且可显式开启。
+			bargainEnabled, bargainErr := s.Cookies.GetAutoBargain(ctx, cid)
+			if bargainErr != nil || bargainEnabled {
+				t.Fatalf("default auto_bargain=%v err=%v want false", bargainEnabled, bargainErr)
+			}
+			// autoBargainUpdate 是显式开启砍价免拼的设置值。
+			autoBargainUpdate := true
+			// updateErr 保存当前方言写入独立自动免拼开关的错误。
+			if _, updateErr := s.Cookies.UpdateSettings(ctx, cid, AccountSettingsUpdate{UserID: user.ID, AutoBargain: &autoBargainUpdate}); updateErr != nil {
+				t.Fatalf("enable auto_bargain: %v", updateErr)
+			}
+			// bargainEnabled、bargainErr 保存显式开启后的独立开关读取结果。
+			if bargainEnabled, bargainErr := s.Cookies.GetAutoBargain(ctx, cid); bargainErr != nil || !bargainEnabled {
+				t.Fatalf("enabled auto_bargain=%v err=%v want true", bargainEnabled, bargainErr)
 			}
 			if // err 用于本次流程后续判断的err
 			_, err := s.DB.ExecContext(ctx,
@@ -830,7 +860,7 @@ func TestMultiDB_OrdersUpsertManyTargetScope(t *testing.T) {
 			rows := []BatchOrderUpsert{{
 				OrderID: "multidb-batch-existing",
 				Options: OrderUpsertOpts{
-					CookieID: cookieID, OrderStatus: "pending_ship", Amount: "12.50", SpecValue: "蓝",
+					CookieID: cookieID, OrderStatus: "pending_ship", Amount: "12.50", SpecValue: "蓝", ChatID: "chat-batch",
 				},
 			}}
 			// batchErr 保存批量 UPSERT 执行错误；PostgreSQL 会在此处验证目标表列限定。
@@ -843,7 +873,7 @@ func TestMultiDB_OrdersUpsertManyTargetScope(t *testing.T) {
 			if getErr != nil {
 				t.Fatalf("get batch order: %v", getErr)
 			}
-			if got.OrderStatus != "shipped" || got.Amount != "12.50" || got.SpecValue != "蓝" || got.IsBargain != 1 || got.Version < 2 {
+			if got.OrderStatus != "shipped" || got.Amount != "12.50" || got.SpecValue != "蓝" || got.IsBargain != 1 || got.ChatID != "chat-batch" || got.Version < 2 {
 				t.Fatalf("batch order=%+v", got)
 			}
 		})
@@ -1113,7 +1143,12 @@ func TestMultiDB_OrdersUpsertManyMixedCreatedAt(t *testing.T) {
 			if emptyExistingErr != nil || emptyNewErr != nil || explicitNewErr != nil {
 				t.Fatalf("读取混合批次失败: %v/%v/%v", emptyExistingErr, emptyNewErr, explicitNewErr)
 			}
-			if emptyExisting.CreatedAt != "" || emptyNew.CreatedAt == "" || explicitNew.CreatedAt != "2024-02-01T00:00:00Z" {
+			// explicitTime、timeErr 将驱动返回的时间解析为 UTC 时刻；断言业务时间而非驱动字符串格式。
+			explicitTime, timeErr := time.Parse(time.RFC3339Nano, explicitNew.CreatedAt)
+			if timeErr != nil {
+				explicitTime, timeErr = time.ParseInLocation("2006-01-02 15:04:05", explicitNew.CreatedAt, time.UTC)
+			}
+			if emptyExisting.CreatedAt != "" || emptyNew.CreatedAt == "" || timeErr != nil || !explicitTime.Equal(time.Date(2024, time.February, 1, 0, 0, 0, 0, time.UTC)) {
 				t.Fatalf("三方言 CreatedAt 语义不一致: emptyExisting=%q emptyNew=%q explicitNew=%q", emptyExisting.CreatedAt, emptyNew.CreatedAt, explicitNew.CreatedAt)
 			}
 		})
@@ -1470,6 +1505,8 @@ func TestMultiDB_LatestMigrationsDownUp(t *testing.T) {
 				{"chat_sessions", "unread_count"},
 				{"chat_sessions", "item_image_url"},
 				{"chat_sessions", "is_visible"},
+				{"chat_sessions", "user_hidden_at"},
+				{"chat_sessions", "messages_cleared_at"},
 				{"chat_messages", "message_key"},
 				{"chat_messages", "read_status"},
 				{"chat_messages", "read_at"},
@@ -1623,6 +1660,11 @@ func TestMultiDB_ChatAndAccountTasks(t *testing.T) {
 			sessions, _ = s.Chats.ListSessions(ctx, user.ID, cookieID, 20)
 			if sessions[0].UnreadCount != 0 {
 				t.Fatalf("unread after mark=%d", sessions[0].UnreadCount)
+			}
+			// matchedChatIDs、matchedChatErr 验证订单同步使用的账号、买家、商品组合查询在三种数据库都能找到会话。
+			matchedChatIDs, matchedChatErr := s.Chats.FindChatIDsByBuyerAndItem(ctx, cookieID, "buyer-1", "item-1")
+			if matchedChatErr != nil || len(matchedChatIDs) != 1 || matchedChatIDs[0] != "chat-1" {
+				t.Fatalf("matched chat IDs=%v err=%v", matchedChatIDs, matchedChatErr)
 			}
 		})
 	}

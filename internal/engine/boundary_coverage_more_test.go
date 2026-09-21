@@ -24,10 +24,150 @@ func (h *transportReadyCoverageHandler) OnTransportReady(context.Context, string
 	h.calls++
 }
 
+// initialTransportReadyCoverageHandler 覆盖每个账号运行实例首次传输就绪后的订单同步回调。
+type initialTransportReadyCoverageHandler struct {
+	// Handler 嵌入基础处理器接口，避免本测试重复实现无关回调。
+	Handler
+	// called 在首次回调实际运行时发送上下文，供测试确认生命周期拥有关系。
+	called chan context.Context
+}
+
+// OnInitialTransportReady 将后台同步任务上下文发送给测试等待者。
+func (h *initialTransportReadyCoverageHandler) OnInitialTransportReady(ctx context.Context, _ string) {
+	h.called <- ctx
+}
+
 // noRefreshCoverageHandler 覆盖密码登录续期明确失败的 token 错误分支。
 type noRefreshCoverageHandler struct {
 	// recordingHandler 提供账号运行所需的基础业务回调。
 	*recordingHandler
+}
+
+// releaseReliabilitySDKOnlyHandler 只改变非签名 Cookie，验证 Token 失效恢复不能因此清零退避。
+type releaseReliabilitySDKOnlyHandler struct {
+	// recordingHandler 提供账号运行所需的其他测试回调。
+	*recordingHandler
+	// store 提供本地凭证写回能力。
+	store *db.Store
+	// refreshCalls 记录即时凭证刷新回调次数。
+	refreshCalls int
+}
+
+// releaseReliabilityAlwaysRefreshHandler 在仓储读取失败时仍返回成功，验证引擎不会把未知状态当作恢复证据。
+type releaseReliabilityAlwaysRefreshHandler struct {
+	// recordingHandler 提供账号运行所需的其他测试回调。
+	*recordingHandler
+	// refreshCalls 记录即时凭证刷新回调次数。
+	refreshCalls int
+}
+
+// OnPasswordLoginRefresh 返回成功但不写仓储，专门覆盖续期后无法读取凭证的保护分支。
+func (h *releaseReliabilityAlwaysRefreshHandler) OnPasswordLoginRefresh(context.Context, string) bool {
+	h.refreshCalls++
+	return true
+}
+
+// OnPasswordLoginRefresh 保留 _m_h5_tk，仅更新 sdkSilent，模拟签名未轮换的假恢复。
+func (h *releaseReliabilitySDKOnlyHandler) OnPasswordLoginRefresh(ctx context.Context, accountID string) bool {
+	h.refreshCalls++
+	// data、err 保存测试账号当前的非敏感凭证视图及读取错误。
+	data, err := h.store.Cookies.GetCookieRuntimeData(ctx, accountID)
+	if err != nil {
+		return false
+	}
+	return h.store.Cookies.UpdateValueExisting(ctx, accountID, data.Value+"; sdkSilent=9999999999999") == nil
+}
+
+// TestReleaseReliabilityTokenRequiresSigningRotation 验证存在可写 sdkSilent 的恢复器时，Token 失效仍只进入可取消退避。
+func TestReleaseReliabilityTokenRequiresSigningRotation(t *testing.T) {
+	// account、handler、store、cleanup 提供本地 SQLite 凭证和连接协调器。
+	account, handler, store, cleanup := newAccountForTest(t)
+	defer cleanup()
+	// refreshHandler 提供修改普通 Cookie 的恢复能力，Token 失败不得依赖该能力重连。
+	refreshHandler := &releaseReliabilitySDKOnlyHandler{recordingHandler: handler, store: store}
+	account.handler = refreshHandler
+	// ctx、cancel 将正常退避压缩为可观察的取消结果。
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	// retry、err 保存 Token 失效处理的重连决定和退避退出原因。
+	retry, err := (&connectionCoordinator{account: account}).handleTokenAcquisitionFailure(ctx, &fakeWSConn{}, &mtop.MTopResponseError{API: "token", Kind: mtop.MTopErrorTokenExpired, HTTPStatus: 200})
+	if retry || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("签名未轮换时不应立即重连: retry=%v err=%v", retry, err)
+	}
+}
+
+// TestInitialTransportReadyRunsOnceAndJoinsLifecycle 验证首次连接同步异步执行一次、重连不重复，并受账号停止生命周期管理。
+func TestInitialTransportReadyRunsOnceAndJoinsLifecycle(t *testing.T) {
+	// handler 保存接收首次传输就绪任务的可选回调。
+	handler := &initialTransportReadyCoverageHandler{called: make(chan context.Context, 2)}
+	// account 保存测试单账号运行实例。
+	account := New(Config{CookieID: "initial-ready", Handler: handler})
+	// runCtx、cancel 是账号运行时生命周期上下文和其关闭函数。
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	account.lifecycle.start(runCtx, cancel)
+	account.notifyInitialTransportReady()
+	account.notifyInitialTransportReady()
+	select {
+	// taskCtx 是首次连接同步任务继承的账号生命周期上下文。
+	case taskCtx := <-handler.called:
+		if taskCtx == nil || taskCtx.Err() != nil {
+			t.Fatal("首次传输就绪任务没有收到有效账号生命周期上下文")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("首次传输就绪没有启动订单同步任务")
+	}
+	select {
+	case <-handler.called:
+		t.Fatal("同一运行实例的重连重复启动了订单同步")
+	case <-time.After(50 * time.Millisecond):
+	}
+	account.Stop()
+}
+
+// TestReleaseReliabilityTokenRefreshIsBounded 验证连续 Token 失效只退避，不能调用账号级续期；t 管理本地测试资源。
+func TestReleaseReliabilityTokenRefreshIsBounded(t *testing.T) {
+	// account、handler、store、cleanup 提供可读取凭证的隔离账号和刷新计数。
+	account, handler, store, cleanup := newAccountForTest(t)
+	defer cleanup()
+	// refreshHandler 记录本轮是否重复调用即时凭证刷新。
+	refreshHandler := &releaseReliabilitySDKOnlyHandler{recordingHandler: handler, store: store}
+	account.handler = refreshHandler
+	// tokenErr 是平台连续拒绝 MTOP 签名 Token 的错误。
+	tokenErr := &mtop.MTopResponseError{API: "token", Kind: mtop.MTopErrorTokenExpired, HTTPStatus: 200}
+	// runFailure 使用短取消窗口执行一次失败处理，避免测试等待真实退避时间。
+	runFailure := func() {
+		// ctx、cancel 将单次退避等待压缩为可观察的取消结果。
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		_, _ = (&connectionCoordinator{account: account}).handleTokenAcquisitionFailure(ctx, &fakeWSConn{}, tokenErr)
+	}
+	runFailure()
+	runFailure()
+	if refreshHandler.refreshCalls != 0 {
+		t.Fatalf("连续 Token 失效不得触发账号续期，次数=%d", refreshHandler.refreshCalls)
+	}
+}
+
+// TestReleaseReliabilityCredentialReadFailureMustBackoff 验证数据库不可读时 Token 错误仍退避且不请求账号续期。
+func TestReleaseReliabilityCredentialReadFailureMustBackoff(t *testing.T) {
+	// account、handler、store、cleanup 提供可控凭证读取失败的隔离账号。
+	account, baseHandler, store, cleanup := newAccountForTest(t)
+	defer cleanup()
+	// handler 提供成功续期回调，但 Token 错误不得调用它，即使数据库已不可读。
+	handler := &releaseReliabilityAlwaysRefreshHandler{recordingHandler: baseHandler}
+	account.handler = handler
+	_ = store.DB.Close()
+	// ctx、cancel 将正常退避压缩为可观察的取消结果。
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	// tokenErr 是平台明确返回的仅 MTOP Token 失效错误。
+	tokenErr := &mtop.MTopResponseError{API: "token", Kind: mtop.MTopErrorTokenExpired, HTTPStatus: 200}
+	// retry、err 保存读取失败后的重连决定和退避退出原因。
+	retry, err := (&connectionCoordinator{account: account}).handleTokenAcquisitionFailure(ctx, &fakeWSConn{}, tokenErr)
+	if retry || !errors.Is(err, context.DeadlineExceeded) || handler.refreshCalls != 0 {
+		t.Fatalf("凭证读取失败应退避且不触发账号续期: retry=%v err=%v refresh=%d", retry, err, handler.refreshCalls)
+	}
 }
 
 // OnPasswordLoginRefresh 返回续期失败，验证连接协调器的认证终止路径。
@@ -58,6 +198,20 @@ func TestEngineCoversTokenFailureAndTransportNotification(t *testing.T) {
 	if !sessionRetry || sessionResult != nil || refreshHandler.refresh != 1 {
 		t.Fatalf("Session 续期成功结果 retry=%v err=%v refresh=%d", sessionRetry, sessionResult, refreshHandler.refresh)
 	}
+	// tokenHandler 验证仅 MTOP Token 失效时不会进入账号级续期。
+	tokenHandler := &recordingHandler{}
+	// tokenAccount 是仅签名 Token 过期恢复路径使用的账号。
+	tokenAccount := New(Config{CookieID: "cid", CookieStr: "unb=1; _m_h5_tk=tk;", Handler: tokenHandler})
+	// tokenErr 是平台明确返回的仅 MTOP Token 失效错误。
+	tokenErr := &mtop.MTopResponseError{API: "token", Kind: mtop.MTopErrorTokenExpired, HTTPStatus: 200}
+	// tokenContext、cancelToken 限制 Token 退避等待，避免测试真实等待一分钟。
+	tokenContext, cancelToken := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancelToken()
+	// tokenRetry、tokenResult 保存 Token 失败后的退避及取消结果。
+	tokenRetry, tokenResult := (&connectionCoordinator{account: tokenAccount}).handleTokenAcquisitionFailure(tokenContext, &fakeWSConn{}, tokenErr)
+	if tokenRetry || !errors.Is(tokenResult, context.DeadlineExceeded) || tokenHandler.refresh != 0 {
+		t.Fatalf("MTOP Token 失败应退避且不续期账号: retry=%v err=%v refresh=%d", tokenRetry, tokenResult, tokenHandler.refresh)
+	}
 	// failedHandler 明确拒绝密码登录续期，验证 Session 终止路径。
 	failedHandler := &noRefreshCoverageHandler{recordingHandler: &recordingHandler{}}
 	// failedAccount 是续期失败路径使用的账号。
@@ -78,6 +232,26 @@ func TestEngineCoversTokenFailureAndTransportNotification(t *testing.T) {
 	// noHandlerAccount 验证未实现可选接口时通知入口安全跳过。
 	noHandlerAccount := New(Config{CookieID: "transport"})
 	noHandlerAccount.notifyTransportReady(ctx)
+}
+
+// TestTokenExpiredRefreshWithoutCredentialChangeUsesBackoff 验证 Token 失效不调用账号续期，并保持可取消退避。
+func TestTokenExpiredRefreshWithoutCredentialChangeUsesBackoff(t *testing.T) {
+	// account、handler、cleanup 保存带数据库凭证的隔离账号及清理责任。
+	account, handler, _, cleanup := newAccountForTest(t)
+	defer cleanup()
+	// ctx 将正常 Token 退避压缩为可控的取消窗口，避免测试真实等待一分钟。
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	// tokenErr 是平台明确返回的仅 MTOP Token 失效错误。
+	tokenErr := &mtop.MTopResponseError{API: "token", Kind: mtop.MTopErrorTokenExpired, HTTPStatus: 200}
+	// retry、result 保存未变化凭证时的处理结果。
+	retry, result := (&connectionCoordinator{account: account}).handleTokenAcquisitionFailure(ctx, &fakeWSConn{}, tokenErr)
+	if retry || !errors.Is(result, context.DeadlineExceeded) {
+		t.Fatalf("未变化凭证应进入退避并响应取消，retry=%v result=%v", retry, result)
+	}
+	if handler.refresh != 0 {
+		t.Fatalf("Token 失效不得调用账号续期回调，got %d", handler.refresh)
+	}
 }
 
 // TestEngineCoversDispatcherDefaultsAndCredentialSnapshotGuard 验证消息分发器默认依赖和无数据库凭证快照边界。

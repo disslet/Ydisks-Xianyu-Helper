@@ -22,6 +22,8 @@ type AccountTaskRepository interface {
 	Get(ctx context.Context, cookieID string) (db.AccountTaskSettings, error)
 	// Enabled 返回启用中的账号任务设置。
 	Enabled(ctx context.Context) ([]db.AccountTaskSettings, error)
+	// DueAutoRateOrderIDs 返回由本地买家确认收货事件确认、可消费的订单号。
+	DueAutoRateOrderIDs(ctx context.Context, cookieID string, limit int) ([]string, error)
 	// ClaimRun 抢占可重复执行的任务运行记录。
 	ClaimRun(ctx context.Context, run db.AccountTaskRun, now int64) (bool, error)
 	// ClaimRunImmediately 抢占人工立即执行的任务运行记录。
@@ -34,10 +36,24 @@ type AccountTaskRepository interface {
 	MarkPolished(ctx context.Context, cookieID, date string, at int64) error
 }
 
+// accountTaskCredentialLocker 表示账号任务写回凭证时可使用的短临界区锁。
+// 锁只保护本地读取与持久化，不得覆盖外部平台调用。
+type accountTaskCredentialLocker interface {
+	LockAccountCredentials(accountID string) func()
+}
+
 // storeAccountTaskRepository 将完整 Store 适配为账号任务窄 repository。
 type storeAccountTaskRepository struct {
 	// store 保存数据库聚合入口，仅在适配器内部使用。
 	store *db.Store
+}
+
+// LockAccountCredentials 委托账号凭证临界区锁，供任务合并最新 Cookie 快照时避免覆盖并发续期。
+func (r storeAccountTaskRepository) LockAccountCredentials(accountID string) func() {
+	if r.store == nil {
+		return func() {}
+	}
+	return r.store.LockAccountCredentials(accountID)
 }
 
 // storeAccountTaskRepositoryCompileCheck 确保 Store 适配器完整实现账号任务窄接口。
@@ -68,6 +84,11 @@ func (r storeAccountTaskRepository) UpdateValueExisting(ctx context.Context, coo
 	return r.store.Cookies.UpdateValueExisting(ctx, cookieID, cookieValue)
 }
 
+// UpdateRenewalCookie 委托保存带完整 metadata 的账号 Cookie。
+func (r storeAccountTaskRepository) UpdateRenewalCookie(ctx context.Context, cookieID, cookieValue, metadataJSON string, lastRefreshAt int64) error {
+	return r.store.Cookies.UpdateRenewalCookie(ctx, cookieID, cookieValue, metadataJSON, lastRefreshAt)
+}
+
 // Get 委托账号任务设置查询。
 func (r storeAccountTaskRepository) Get(ctx context.Context, cookieID string) (db.AccountTaskSettings, error) {
 	return r.store.AccountTasks.Get(ctx, cookieID)
@@ -76,6 +97,11 @@ func (r storeAccountTaskRepository) Get(ctx context.Context, cookieID string) (d
 // Enabled 委托启用任务设置查询。
 func (r storeAccountTaskRepository) Enabled(ctx context.Context) ([]db.AccountTaskSettings, error) {
 	return r.store.AccountTasks.Enabled(ctx)
+}
+
+// DueAutoRateOrderIDs 委托读取本地买家确认收货事件确认的自动评价候选订单。
+func (r storeAccountTaskRepository) DueAutoRateOrderIDs(ctx context.Context, cookieID string, limit int) ([]string, error) {
+	return r.store.AccountTasks.DueAutoRateOrderIDs(ctx, cookieID, limit)
 }
 
 // ClaimRun 委托任务运行抢占。

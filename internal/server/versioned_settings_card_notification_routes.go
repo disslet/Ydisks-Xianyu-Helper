@@ -20,6 +20,7 @@ func (s *Server) mountVersionedSettingsCardNotificationRoutes(r chi.Router) {
 		r.Put("/api/v1/settings/system", s.setSettings)
 		r.Put("/api/v1/settings/system/{key}", s.setSetting)
 		r.Post("/api/v1/settings/ai-models", s.listAIModels)
+		r.Post("/api/v1/settings/ai-test", s.testAIConnection)
 		r.Get("/api/v1/admin/notifications/outbox/uncertain", s.listAdminUncertainNotifications)
 	})
 
@@ -46,6 +47,7 @@ func (s *Server) mountVersionedSettingsCardNotificationRoutes(r chi.Router) {
 		r.Delete("/api/v1/cards/{card_id}", s.deleteCard)
 
 		r.Get("/api/v1/notifications/channels", s.listChannels)
+		r.Get("/api/v1/notifications/channels/{channel_id}", s.getChannelEditor)
 		r.Post("/api/v1/notifications/channels", s.createChannel)
 		r.Put("/api/v1/notifications/channels/{channel_id}", s.updateChannel)
 		r.Delete("/api/v1/notifications/channels/{channel_id}", s.deleteChannel)

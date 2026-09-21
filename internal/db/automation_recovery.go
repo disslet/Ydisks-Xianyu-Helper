@@ -27,10 +27,10 @@ func (a *AutomationRules) RecoverDefinitelyUnsentReviewRuns(ctx context.Context)
 	return res.RowsAffected()
 }
 
-// DeferTask 封装Defer任务业务协调。
-func (a *AutomationRules) DeferTask(ctx context.Context, task DeferredAutomationTask) error {
-	// err 用于本次流程后续判断的err
-	_, err := a.DB.ExecContext(ctx, `INSERT INTO automation_pending_tasks
+// deferTask 使用 a 的方言在 execer 归属锁事务中写入 task；ctx 控制取消，返回写入错误，提交由调用方负责。
+func (a *AutomationRules) deferTask(ctx context.Context, execer sqlExecer, task DeferredAutomationTask) error {
+	// err 保存延期 UPSERT 错误，原有重置尝试预算和延迟语义保持不变。
+	_, err := execer.ExecContext(ctx, `INSERT INTO automation_pending_tasks
     (task_key,cookie_id,trigger_type,task_json,due_at,status,attempt_count,lease_expires_at,error_message)
 VALUES (?,?,?,?,?,'pending',0,0,?)`+dialectUpsert(a.Dialect, []string{"task_key"}, map[string]string{
 		"cookie_id":        "excluded.cookie_id",
@@ -170,6 +170,14 @@ type automationRecoverySnapshot struct {
 
 // automationIssuePolicy 封装自动化问题Policy业务协调。
 func automationIssuePolicy(rawEventJSON string, actionStarted bool, actionCursor int, ruleEnabled bool, sentCount int, errorMessage string) (string, []string) {
+	if strings.HasPrefix(errorMessage, "人工补发失败，外部结果可能未知") {
+		// 人工补发已经重新发送过快照或尝试确认发货，不能用 continue 跳过确认动作造成假收口。
+		return "external_result_unknown", []string{"cancel"}
+	}
+	if !actionStarted && sentCount > 0 && automationSnapshotHasDeliveryAction(rawEventJSON) {
+		// 历史记录若丢失动作占用标志而已有发送数量，无法证明当前动作未执行，必须人工核对。
+		return "partial_failure", []string{"cancel"}
+	}
 	if actionStarted {
 		// 外部接口没有可依赖的幂等键。结果未知时禁止 retry；未知发卡且后续需要确认时还禁止 continue。
 		if !automationUnknownActionCanContinue(rawEventJSON, actionCursor) {
@@ -200,6 +208,22 @@ func automationIssuePolicy(rawEventJSON string, actionStarted bool, actionCursor
 		return "partial_failure", []string{"continue", "retry", "cancel"}
 	}
 	return "execution_failed", []string{"retry", "cancel"}
+}
+
+// automationSnapshotHasDeliveryAction 判断历史快照是否包含可能重复消耗卡密的发货动作。
+func automationSnapshotHasDeliveryAction(rawEventJSON string) bool {
+	// snapshot 保存从历史任务快照解析出的动作计划。
+	var snapshot automationRecoverySnapshot
+	if json.Unmarshal([]byte(rawEventJSON), &snapshot) != nil {
+		return false
+	}
+	// action 表示历史快照中的一个动作定义。
+	for _, action := range snapshot.ActionPlan {
+		if action.ActionType == "send_card" || action.ActionType == "send_template" {
+			return true
+		}
+	}
+	return false
 }
 
 // automationUnknownActionCanContinue 判断结果未知的当前动作是否可以由人工确认后跳过。
@@ -517,6 +541,69 @@ WHERE o.system_shipped=1
 		out = append(out, ord)
 	}
 	return out, rows.Err()
+}
+
+// ReopenRunForRecovery 在账号→订单锁内把处于人工核对或明确失败的运行重新置为可执行，并递增代次使旧检查点失效。
+// 同一订单已有其它 order_paid 运行处于 running 时拒绝抢占；返回 false 表示运行状态、代次或订单执行权已经变化。
+func (a *AutomationRules) ReopenRunForRecovery(ctx context.Context, runID int64, attempt int, leaseExpiresAt int64) (bool, error) {
+	if a == nil || a.DB == nil {
+		return false, errors.New("自动化运行存储未初始化")
+	}
+	// cookieID、orderID 保存运行固定的归属身份，仅用于取得账号与订单写锁，不读取任务快照或凭证。
+	var cookieID, orderID string
+	// readErr 保存运行身份读取错误；不存在的运行按未抢占处理；身份读取在事务外避免 SQLite 读快照阻塞后续写锁。
+	readErr := a.DB.QueryRowContext(ctx,
+		`SELECT cookie_id,COALESCE(order_id,'') FROM automation_runs WHERE id=?`, runID).Scan(&cookieID, &orderID)
+	if errors.Is(readErr, sql.ErrNoRows) {
+		return false, nil
+	}
+	if readErr != nil {
+		return false, readErr
+	}
+	// transaction、beginErr 保存本次重开使用的短事务；事务提交前不允许外部动作观察到 running 状态。
+	transaction, beginErr := a.DB.BeginTx(ctx, nil)
+	if beginErr != nil {
+		return false, beginErr
+	}
+	defer transaction.Rollback()
+	// lockErr 按与 TryStartRun/StartRunAction 相同的账号→订单顺序取得写锁，串行化同订单运行抢占。
+	if lockErr := lockAutomationOwnership(ctx, transaction, cookieID, orderID); lockErr != nil {
+		return false, lockErr
+	}
+	if strings.TrimSpace(orderID) != "" {
+		// activeCount 保存同订单其它付款运行的活动数量；存在活动运行时不能再重开历史运行。
+		var activeCount int
+		// countErr 保存查询同订单活动运行数量时的数据库错误。
+		if countErr := transaction.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM automation_runs
+ WHERE order_id=? AND trigger_type='order_paid' AND status='running' AND id<>?`, orderID, runID).Scan(&activeCount); countErr != nil {
+			return false, countErr
+		}
+		if activeCount > 0 {
+			return false, nil
+		}
+	}
+	// res、updateErr 保存带状态、代次和动作占用条件的原子重开结果。
+	res, updateErr := transaction.ExecContext(ctx, `UPDATE automation_runs
+	   SET status='running',action_started=0,attempt_count=attempt_count+1,
+	       lease_expires_at=?,next_retry_at=0,error_message='',updated_at=CURRENT_TIMESTAMP
+	 WHERE id=? AND attempt_count=? AND status IN ('needs_review','failed') AND action_started=0`, leaseExpiresAt, runID, attempt)
+	if updateErr != nil {
+		return false, updateErr
+	}
+	// n、rowsErr 保存实际更新的行数和驱动计数错误；只有恰好一行才算抢到本次恢复。
+	n, rowsErr := res.RowsAffected()
+	if rowsErr != nil {
+		return false, rowsErr
+	}
+	if n != 1 {
+		return false, nil
+	}
+	// commitErr 确认运行状态与订单执行权一起持久化后才向调度器返回成功。
+	if commitErr := transaction.Commit(); commitErr != nil {
+		return false, commitErr
+	}
+	return true, nil
 }
 
 // createAutomationRuleTx 封装create自动化规则Tx业务协调。

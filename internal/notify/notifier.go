@@ -30,7 +30,19 @@ const (
 	EventSecurityVerification = "security_verification"
 	EventTokenRenewal         = "token_renewal"
 	EventDeliveryResult       = "delivery_result"
-	EventSystemError          = "system_error"
+	// EventAutomationOrderCreated 表示“拍下改价”自动化任务的终态通知。
+	EventAutomationOrderCreated = "automation_order_created"
+	// EventAutomationOrderPaid 表示“付款发货”自动化任务的终态通知。
+	EventAutomationOrderPaid = "automation_order_paid"
+	// EventAutomationBuyerReviewed 表示“评价赠品”自动化任务的终态通知。
+	EventAutomationBuyerReviewed = "automation_buyer_reviewed"
+	// EventAutomationReviewMissingTimeout 表示“求评价”自动化任务的终态通知。
+	EventAutomationReviewMissingTimeout = "automation_review_missing_timeout"
+	// EventManualDeliveryResult 表示人工发货结果通知；它与四种自动化任务分开筛选。
+	EventManualDeliveryResult = "manual_delivery_result"
+	// EventManualInterventionRequired 表示自动化已停止且必须由用户人工判断或处理。
+	EventManualInterventionRequired = "manual_intervention_required"
+	EventSystemError                = "system_error"
 	// legacyNotifierOperationTimeout 是兼容无 Context 通知与等待入口的最长数据库或网络预算。
 	legacyNotifierOperationTimeout = 10 * time.Second
 )
@@ -44,6 +56,8 @@ type NotificationEvent struct {
 	Body      string
 	Fields    map[string]string
 	Time      time.Time
+	// SubscriptionFallbackTypes 保存兼容旧订阅配置的候选类别；只参与渠道过滤，不改变实际入队类别和通知展示。
+	SubscriptionFallbackTypes []string
 }
 
 // Notifier 通知发送器。
@@ -99,6 +113,9 @@ func (n *Notifier) Start(ctx context.Context) {
 		defer close(n.done)
 		n.runOutbox(ctx)
 	}()
+	if n.logger != nil {
+		n.logger.Info("通知 outbox worker 已启动")
+	}
 }
 
 // Wait 等待 outbox worker 随生命周期 context 退出，并兼容旧调用方。
@@ -137,7 +154,7 @@ func (n *Notifier) NotifyDelivery(accountID, buyerName, buyerID, itemID, message
 	defer notificationCancel()
 	n.NotifyEvent(notificationCtx, NotificationEvent{
 		AccountID: accountID,
-		Type:      EventDeliveryResult,
+		Type:      EventManualDeliveryResult,
 		Level:     "info",
 		Title:     "自动发货通知",
 		Body:      message,
@@ -154,16 +171,38 @@ func (n *Notifier) NotifyDelivery(accountID, buyerName, buyerID, itemID, message
 // runID 与 status 共同构成稳定幂等键：同一次恢复重复报告同一终态时不会重复入队；
 // 状态改变时保留独立通知，便于人工核对后继续执行的运行报告最终结果。
 func (n *Notifier) NotifyAutomationRun(ctx context.Context, runID int64, accountID, buyerID, itemID, status, message, chatID string) {
+	n.notifyAutomationRun(ctx, EventDeliveryResult, runID, accountID, buyerID, itemID, status, message, chatID)
+}
+
+// NotifyAutomationRunForTrigger 将自动化运行终态按具体触发类别持久化到 outbox。
+// triggerType 使用 automation 包的稳定触发编码；未知编码回退到旧交易事件，保证兼容调用方仍能收到通知。
+func (n *Notifier) NotifyAutomationRunForTrigger(ctx context.Context, triggerType string, runID int64, accountID, buyerID, itemID, status, message, chatID string) {
+	n.notifyAutomationRun(ctx, automationEventType(triggerType), runID, accountID, buyerID, itemID, status, message, chatID)
+}
+
+// notifyAutomationRun 统一处理自动化终态通知的输入校验、格式化和幂等入队。
+func (n *Notifier) notifyAutomationRun(ctx context.Context, eventType string, runID int64, accountID, buyerID, itemID, status, message, chatID string) {
 	if n == nil || runID <= 0 || strings.TrimSpace(status) == "" {
+		if n != nil && n.logger != nil {
+			n.logger.Warn("忽略无效的自动化终态通知", "run_id", runID, "account_id", accountID, "status", status)
+		}
 		return
 	}
 	// idempotencyKey 绑定自动化运行主键与终态，避免恢复扫描或状态收口重试创建新 outbox 消息。
 	idempotencyKey := fmt.Sprintf("automation-run:%d:%s", runID, strings.TrimSpace(status))
+	// notificationType、notificationLevel、notificationTitle 和 fallbackTypes 共同区分普通终态与必须人工介入的终态。
+	notificationType, notificationLevel, notificationTitle := eventType, "info", "自动化运行通知"
+	// fallbackTypes 保存人工处理终态原本所属的自动化类别，兼容现有渠道订阅。
+	var fallbackTypes []string
+	if strings.TrimSpace(status) == "needs_review" {
+		notificationType, notificationLevel, notificationTitle = EventManualInterventionRequired, "critical", "自动化需要人工处理"
+		fallbackTypes = []string{eventType}
+	}
 	n.notifyEvent(ctx, NotificationEvent{
 		AccountID: accountID,
-		Type:      EventDeliveryResult,
-		Level:     "info",
-		Title:     "自动化运行通知",
+		Type:      notificationType,
+		Level:     notificationLevel,
+		Title:     notificationTitle,
 		Body:      message,
 		Fields: map[string]string{
 			"买家":   fmt.Sprintf("(ID: %s)", buyerID),
@@ -171,7 +210,52 @@ func (n *Notifier) NotifyAutomationRun(ctx context.Context, runID int64, account
 			"聊天ID": fallback(chatID, "未知"),
 			"结果":   message,
 		},
+		SubscriptionFallbackTypes: fallbackTypes,
 	}, idempotencyKey)
+}
+
+// NotifyManualIntervention 将没有 automation_run 主键的自动化异常按稳定业务键写入人工处理通知。
+// triggerType 标识原自动化类别，action 描述需要人工处理的环节；idempotencyKey 必须由订单和阶段等稳定事实构成，禁止使用随机值。
+func (n *Notifier) NotifyManualIntervention(ctx context.Context, triggerType, accountID, orderID, itemID, buyerID, action, reason, chatID, idempotencyKey string) {
+	if n == nil || strings.TrimSpace(accountID) == "" || strings.TrimSpace(idempotencyKey) == "" {
+		return
+	}
+	// message 汇总人工处理环节与原因，避免用户只看到系统错误却不知道应检查哪个订单。
+	message := fmt.Sprintf("%s（订单 %s）需要人工处理：%s", fallback(action, "自动化任务"), fallback(orderID, "未知"), fallback(reason, "执行结果无法确认"))
+	// sourceEventType 保存该人工处理事件原本所属的自动化类别，兼容用户已有的细分类别订阅。
+	sourceEventType := automationEventType(triggerType)
+	n.notifyEvent(ctx, NotificationEvent{
+		AccountID: accountID,
+		Type:      EventManualInterventionRequired,
+		Level:     "critical",
+		Title:     "自动化需要人工处理",
+		Body:      message,
+		Fields: map[string]string{
+			"订单ID": orderID,
+			"商品ID": itemID,
+			"买家ID": buyerID,
+			"聊天ID": fallback(chatID, "未知"),
+			"处理环节": fallback(action, "自动化任务"),
+			"原因":   fallback(reason, "执行结果无法确认"),
+		},
+		SubscriptionFallbackTypes: []string{sourceEventType},
+	}, strings.TrimSpace(idempotencyKey))
+}
+
+// automationEventType 将自动化触发编码转换为通知筛选编码。
+func automationEventType(triggerType string) string {
+	switch strings.TrimSpace(triggerType) {
+	case "order_created":
+		return EventAutomationOrderCreated
+	case "order_paid", "bargain_pending":
+		return EventAutomationOrderPaid
+	case "buyer_reviewed":
+		return EventAutomationBuyerReviewed
+	case "review_missing_timeout":
+		return EventAutomationReviewMissingTimeout
+	default:
+		return EventDeliveryResult
+	}
 }
 
 // NotifyAccountAlert 发送账号告警通知（token 失效/自动恢复失败/风控验证等）。
@@ -203,6 +287,9 @@ func (n *Notifier) NotifyEvent(ctx context.Context, ev NotificationEvent) {
 // notifyEvent 根据事件类型筛选渠道并发送通知；idempotencyKey 只用于 outbox 持久化去重，不能为空时必须来自稳定业务事实。
 func (n *Notifier) notifyEvent(ctx context.Context, ev NotificationEvent, idempotencyKey string) {
 	if n == nil || n.repository == nil {
+		if n != nil && n.logger != nil {
+			n.logger.Warn("通知入队跳过：通知仓储未初始化", "event_type", ev.Type, "account_id", ev.AccountID)
+		}
 		return
 	}
 	if ctx == nil {
@@ -214,7 +301,12 @@ func (n *Notifier) notifyEvent(ctx context.Context, ev NotificationEvent, idempo
 	}
 	// channels、err 用于本次流程后续判断的channels、err
 	channels, err := n.repository.AccountChannels(ctx, ev.AccountID)
-	if err != nil || len(channels) == 0 {
+	if err != nil {
+		n.logger.Error("查询通知渠道失败", "event_type", ev.Type, "account_id", ev.AccountID, "err", logsafe.Error(err))
+		return
+	}
+	if len(channels) == 0 {
+		n.logger.Info("通知事件未找到已启用渠道", "event_type", ev.Type, "account_id", ev.AccountID)
 		return
 	}
 	// full 用于本次流程后续判断的full
@@ -224,7 +316,7 @@ func (n *Notifier) notifyEvent(ctx context.Context, ev NotificationEvent, idempo
 	// ch 表示当前遍历过程中的ch
 	for _, ch := range channels {
 		// allowed、err 用于本次流程后续判断的allowed、err
-		allowed, err := eventAllowed(ch.EventTypes, ev.Type)
+		allowed, err := eventAllowedWithFallbacks(ch.EventTypes, ev.Type, ev.SubscriptionFallbackTypes)
 		if err != nil {
 			n.logger.Warn("通知事件订阅配置无效，跳过渠道", "channel", ch.ID, "event_types", ch.EventTypes, "err", err)
 			continue
@@ -233,6 +325,10 @@ func (n *Notifier) notifyEvent(ctx context.Context, ev NotificationEvent, idempo
 			continue
 		}
 		eligible = append(eligible, ch)
+	}
+	if len(eligible) == 0 {
+		n.logger.Info("通知事件没有匹配的订阅渠道", "event_type", ev.Type, "account_id", ev.AccountID, "channel_count", len(channels))
+		return
 	}
 	// 自动化运行终态必须先进入 outbox：即使 worker 尚未随应用生命周期启动，也不能回退到
 	// 同步网络发送，否则会绕过业务幂等键和发送成功后的 uncertain 隔离。
@@ -245,7 +341,9 @@ func (n *Notifier) notifyEvent(ctx context.Context, ev NotificationEvent, idempo
 		}
 		if // err 用于本次流程后续判断的err
 		err := n.repository.EnqueueOutbox(ctx, messages); err != nil {
-			n.logger.Error("持久化通知失败", "event_type", ev.Type, "err", err)
+			n.logger.Error("持久化通知失败", "event_type", ev.Type, "account_id", ev.AccountID, "channel_count", len(eligible), "err", logsafe.Error(err))
+		} else {
+			n.logger.Info("自动化通知已写入 outbox", "event_type", ev.Type, "account_id", ev.AccountID, "channel_count", len(eligible), "idempotency_key", idempotencyKey)
 		}
 		return
 	}
@@ -254,6 +352,8 @@ func (n *Notifier) notifyEvent(ctx context.Context, ev NotificationEvent, idempo
 		if // err 用于本次流程后续判断的err
 		err := n.send(ch, full); err != nil {
 			n.logger.Error("发送通知失败", "channel", ch.Type, "event_type", ev.Type, "err", logsafe.ExternalError(err))
+		} else {
+			n.logger.Info("通知已发送", "channel", ch.Type, "channel_id", ch.ID, "event_type", ev.Type)
 		}
 	}
 }
@@ -314,10 +414,16 @@ func (n *Notifier) drainOutbox(ctx context.Context) {
 			n.retryOutbox(ctx, message, workerToken, sendErr)
 			continue
 		}
+		// completionCtx 脱离 worker 取消但保留有界超时，确保外部成功后本地确认仍有机会完成。
+		completionCtx, completionCancel := notifierCompletionContext(ctx)
 		if // completed、completeErr 用于本次流程后续判断的completed、completeErr
-		completed, completeErr := n.repository.CompleteOutbox(ctx, message.ID, workerToken); completeErr != nil {
+		completed, completeErr := n.repository.CompleteOutbox(completionCtx, message.ID, workerToken); completeErr != nil {
+			completionCancel()
 			// uncertain、uncertainErr 保存发送成功后的隔离结果和隔离失败错误。
-			uncertain, uncertainErr := n.repository.MarkOutboxUncertain(ctx, message.ID, workerToken, completeErr.Error())
+			uncertainCtx, uncertainCancel := notifierCompletionContext(ctx)
+			// uncertain 和 uncertainErr 保存不确定隔离写入结果及基础设施错误。
+			uncertain, uncertainErr := n.repository.MarkOutboxUncertain(uncertainCtx, message.ID, workerToken, completeErr.Error())
+			uncertainCancel()
 			if uncertainErr != nil {
 				n.logger.Error("确认通知投递完成失败且无法隔离消息", "outbox_id", message.ID, "err", logsafe.Error(errors.Join(completeErr, uncertainErr)))
 			} else if !uncertain {
@@ -326,9 +432,20 @@ func (n *Notifier) drainOutbox(ctx context.Context) {
 				n.logger.Warn("通知已发送但本地确认失败，消息已隔离", "outbox_id", message.ID, "err", logsafe.Error(completeErr))
 			}
 		} else if !completed {
+			completionCancel()
 			n.logger.Warn("通知 outbox 租约已转移", "outbox_id", message.ID)
+		} else {
+			completionCancel()
+			n.logger.Info("通知 outbox 发送成功", "outbox_id", message.ID, "channel_id", message.ChannelID, "channel", channel.Type, "event_type", message.EventType, "attempt", message.AttemptCount)
 		}
 	}
+}
+
+// notifierCompletionContext 为外部通知已经成功后的本地 outbox 收口创建独立的有界上下文。
+func notifierCompletionContext(parent context.Context) (context.Context, context.CancelFunc) {
+	// base 是脱离 worker 取消但仍受本地超时限制的上下文根；调用方必须传入 worker 上下文。
+	base := context.WithoutCancel(parent)
+	return context.WithTimeout(base, 5*time.Second)
 }
 
 // retryOutbox 封装重试Outbox业务协调。
@@ -407,6 +524,18 @@ func eventLabel(eventType string) string {
 		return "续期通知"
 	case EventDeliveryResult:
 		return "交易通知"
+	case EventAutomationOrderCreated:
+		return "拍下改价"
+	case EventAutomationOrderPaid:
+		return "付款发货"
+	case EventAutomationBuyerReviewed:
+		return "评价赠品"
+	case EventAutomationReviewMissingTimeout:
+		return "求评价"
+	case EventManualDeliveryResult:
+		return "手动发货结果"
+	case EventManualInterventionRequired:
+		return "需要人工处理"
 	case EventSystemError:
 		return "系统错误"
 	default:
@@ -511,7 +640,41 @@ func eventAllowed(raw, eventType string) (bool, error) {
 	if len(events) == 0 {
 		return true, nil
 	}
-	return events[eventType], nil
+	if events[eventType] {
+		return true, nil
+	}
+	// delivery_result 是旧版统一交易开关；保留它对新四类自动化事件、人工发货结果和人工处理告警的兼容放行。
+	if events[EventDeliveryResult] && (isAutomationEventType(eventType) || eventType == EventManualDeliveryResult || eventType == EventManualInterventionRequired) {
+		return true, nil
+	}
+	return false, nil
+}
+
+// eventAllowedWithFallbacks 先匹配事件实际类别，再匹配来源类别，保证新增人工处理分类不会切断旧自动化订阅。
+func eventAllowedWithFallbacks(raw, eventType string, fallbackTypes []string) (bool, error) {
+	// allowed、err 保存实际事件类别的订阅判断结果。
+	allowed, err := eventAllowed(raw, eventType)
+	if err != nil || allowed {
+		return allowed, err
+	}
+	// fallbackType 表示当前兼容检查的来源事件类别。
+	for _, fallbackType := range fallbackTypes {
+		allowed, err = eventAllowed(raw, fallbackType)
+		if err != nil || allowed {
+			return allowed, err
+		}
+	}
+	return false, nil
+}
+
+// isAutomationEventType 判断事件是否属于四类可单独控制的自动化任务。
+func isAutomationEventType(eventType string) bool {
+	switch eventType {
+	case EventAutomationOrderCreated, EventAutomationOrderPaid, EventAutomationBuyerReviewed, EventAutomationReviewMissingTimeout:
+		return true
+	default:
+		return false
+	}
 }
 
 // parseEventTypes 封装parseEventTypes业务协调。

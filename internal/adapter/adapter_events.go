@@ -36,8 +36,8 @@ func (a *Adapter) HandleChatMessage(ctx context.Context, message engine.ChatMess
 	}
 	// stored、inserted、err 保存落库消息、是否首次插入及持久化错误。
 	stored, inserted, err := a.chat.RecordIncoming(ctx, chat.Incoming{
-		AccountID: message.AccountID, ChatID: message.ChatID, BuyerID: message.SenderUserID,
-		BuyerName: message.SenderName, Text: message.Text, MessageID: message.MessageID, ItemID: message.ItemID, Raw: message.Raw,
+		AccountID: message.AccountID, AccountUserID: protocol.TransCookies(message.CookieStr)["unb"], ChatID: message.ChatID, BuyerID: message.SenderUserID,
+		BuyerName: message.SenderName, Text: message.Text, MessageID: message.MessageID, ItemID: message.ItemID, ObservedAt: message.ObservedAt, Raw: message.Raw,
 	})
 	if stored != nil {
 		a.logger.Debug("实时聊天消息已入库", "account", message.AccountID, "chat_id", message.ChatID,
@@ -46,17 +46,34 @@ func (a *Adapter) HandleChatMessage(ctx context.Context, message engine.ChatMess
 	return err
 }
 
-// HandleOutgoingChatMessage records successful manual/automatic text sends as
-// a side channel; it never participates in platform delivery.
-// HandleOutgoingChatMessage 处理Outgoing聊天消息。
-func (a *Adapter) HandleOutgoingChatMessage(ctx context.Context, message engine.OutgoingChatMessage) error {
-	if a.chat == nil {
-		return nil
+// ChatSessionRole 返回消息所属会话和商品的本地角色结论，不读取账号凭证明文。
+func (a *Adapter) ChatSessionRole(ctx context.Context, accountID, chatID, itemID string) (db.ChatSession, error) {
+	if a == nil || a.chat == nil {
+		return db.ChatSession{CookieID: accountID, ChatID: chatID, ItemID: itemID, AccountRole: "unknown"}, nil
 	}
-	// err 用于本次流程后续判断的err
-	_, err := a.chat.RecordOutgoingSent(ctx, db.ChatSession{CookieID: message.AccountID, ChatID: message.ChatID,
-		BuyerID: message.BuyerID}, message.MessageKey, message.Text)
-	return err
+	return a.chat.SessionRole(ctx, accountID, chatID, itemID)
+}
+
+// ItemBelongsToAccount 判断商品是否仍在当前账号的有效本地商品集合中。
+// 本地归属是自动回复识别卖家角色的确定证据；查询只返回存在性，不读取或解密 Cookie、Token 等敏感字段。
+func (a *Adapter) ItemBelongsToAccount(ctx context.Context, accountID, itemID string) (bool, error) {
+	if a == nil || a.store == nil || a.store.Items == nil {
+		return false, errors.New("商品归属仓储未初始化")
+	}
+	// _, lookupErr 只读取账号和商品主键；商品不存在代表当前账号不能安全地作为卖家自动回复。
+	_, lookupErr := a.store.Items.GetByCookieItem(ctx, accountID, itemID)
+	if errors.Is(lookupErr, db.ErrNotFound) {
+		return false, nil
+	}
+	return lookupErr == nil, lookupErr
+}
+
+// SaveChatSessionRole 保存一次本地商品归属核验得到的会话角色，不修改 Cookie 或 Token。
+func (a *Adapter) SaveChatSessionRole(ctx context.Context, accountID, chatID, itemID, accountRole, buyerUserID, sellerUserID, roleSource string) error {
+	if a == nil || a.chat == nil {
+		return errors.New("聊天服务未初始化")
+	}
+	return a.chat.UpdateSessionRole(ctx, accountID, chatID, itemID, accountRole, buyerUserID, sellerUserID, roleSource)
 }
 
 // HandleMessageRead 接收平台出站消息已读回执，并把非敏感已读状态更新委托给聊天服务。
@@ -319,7 +336,7 @@ func (a *Adapter) HandleSystemEvent(ctx context.Context, task automation.Task) e
 }
 
 // FetchOrderDetail 实现 automation.OrderDetailFetcher。只在本地订单缺少关键字段时
-// 调用纯 Go MTOP 客户端，并将详情请求串行化、至少间隔 3 秒，避免短时间高频访问闲鱼。
+// 调用共享协调器；协调器按账号限流并合并同订单并发访问，避免成交事件触发短时间高频访问闲鱼。
 // FetchOrderDetail 封装Fetch订单Detail业务协调。
 func (a *Adapter) FetchOrderDetail(ctx context.Context, cookieID, orderID, itemID, buyerID, _ string) (*automation.OrderDetail, error) {
 	if // detail、ok 用于本次流程后续判断的detail、ok
@@ -334,9 +351,9 @@ func (a *Adapter) FetchOrderDetail(ctx context.Context, cookieID, orderID, itemI
 	if err == nil || !mtop.IsSessionExpiredErr(err) {
 		return detail, err
 	}
-	a.logger.Warn("订单详情检测到 Session 过期，开始即时续期", "account", cookieID, "order_id", orderID)
+	a.logger.Warn("订单详情检测到凭证失效，开始即时续期", "account", cookieID, "order_id", orderID)
 	if !a.OnPasswordLoginRefresh(ctx, cookieID) {
-		return nil, fmt.Errorf("订单详情 Session 过期且即时续期失败: %w", err)
+		return nil, fmt.Errorf("订单详情凭证失效且即时续期失败: %w", err)
 	}
 	a.logger.Info("Cookie 即时续期成功，重新请求订单详情", "account", cookieID, "order_id", orderID)
 	return a.fetchOrderDetailAttempt(ctx, cookieID, orderID)
@@ -344,25 +361,10 @@ func (a *Adapter) FetchOrderDetail(ctx context.Context, cookieID, orderID, itemI
 
 // fetchOrderDetailAttempt 封装fetch订单Detail尝试次数业务协调。
 func (a *Adapter) fetchOrderDetailAttempt(ctx context.Context, cookieID, orderID string) (*automation.OrderDetail, error) {
-
-	a.orderFetchMu.Lock()
-	defer a.orderFetchMu.Unlock()
-	// 等锁期间其他流程可能已经补齐订单，再检查一次。
+	// 等待其他同订单调用期间本地事实可能已经补齐，再检查一次避免无意义平台请求。
 	if detail, ok := a.localOrderDetail(ctx, orderID); ok {
 		return detail, nil
 	}
-	if // remain 用于本次流程后续判断的remain
-	remain := 3*time.Second - time.Since(a.lastOrderFetch); !a.lastOrderFetch.IsZero() && remain > 0 {
-		// timer 用于本次流程后续判断的定时器
-		timer := time.NewTimer(remain)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-timer.C:
-		}
-	}
-	a.lastOrderFetch = time.Now()
 	// credentialUnlock 用于本次流程后续判断的credentialUnlock
 	credentialUnlock := a.store.LockAccountCredentials(cookieID)
 	// credentialLocked 标识当前调用是否持有账号凭证锁。
@@ -394,8 +396,8 @@ func (a *Adapter) fetchOrderDetailAttempt(ctx context.Context, cookieID, orderID
 	// 账号凭证快照已读取完成；慢速 MTOP 请求不得继续持有共享凭证锁。
 	credentialUnlock()
 	credentialLocked = false
-	// detail、fetchErr 用于本次流程后续判断的detail、fetchErr
-	detail, fetchErr := a.orderMTop.FetchOrderDetail(requestCtx, cookieStr, orderID)
+	// detail、fetchErr 保存共享限流和同订单去重后的平台详情结果及错误。
+	detail, fetchErr := a.orderDetails.Fetch(requestCtx, cookieID, orderID, cookieStr, a.orderMTop)
 	// authoritativeCookies、authoritativeSnapshot、sessionChanged 用于本次流程后续判断的authoritativeCookies、authoritativeSnapshot、sessionChanged
 	authoritativeCookies, authoritativeSnapshot, sessionChanged := cookieSession.State()
 	// credentialUnlock 保存重新进入凭证提交临界区的释放函数。
@@ -569,6 +571,20 @@ func (a *Adapter) OnTransportReady(ctx context.Context, cookieID string) {
 	a.wakeCredentialBlockedAutomation(ctx, cookieID)
 }
 
+// OnInitialTransportReady 在单个账号运行实例首次 WebSocket 注册完成后同步订单快照。
+// 同步由 engine 的账号生命周期任务拥有；失败只记录脱敏诊断，不阻断 WebSocket 消息接收或重连。
+func (a *Adapter) OnInitialTransportReady(ctx context.Context, cookieID string) {
+	// syncOrders 是构造期固定的订单同步回调，nil 保持隔离测试和未装配运行模式无副作用。
+	syncOrders := a.initialOrderSync
+	if syncOrders == nil {
+		return
+	}
+	// syncErr 保存首次连接订单同步的失败原因，不携带 Cookie、Token 等敏感请求数据。
+	if syncErr := syncOrders(ctx, cookieID); syncErr != nil {
+		a.logger.Warn("账号首次连接后的订单同步失败", "cookie_id", cookieID, "err", syncErr)
+	}
+}
+
 // beginPasswordLogin 兼容旧测试对账号恢复登记的访问；生产路径统一使用 account.CredentialRefreshCoordinator.Run。
 func (a *Adapter) beginPasswordLogin(cookieID string) bool {
 	if a.passwordCoordinator == nil {
@@ -673,38 +689,6 @@ func (a *Adapter) tryProtocolCredentialRenew(ctx context.Context, d *db.CookiePl
 	current := d.Value
 	// api 用于本次流程后续判断的api
 	api := a.renewSvc
-	// save 用于本次流程后续判断的save
-	save := func(cookieStr string, setCookies []string, completeSnapshot []cookierefresh.BrowserCookie) error {
-		if cookieStr == current && len(setCookies) == 0 && completeSnapshot == nil {
-			return nil
-		}
-		// metadata 用于本次流程后续判断的metadata
-		metadata := cookierefresh.MetadataWithoutSnapshot(d.MetadataJSON)
-		if completeSnapshot != nil {
-			// API 在完整 Jar 基础上得到的快照是权威结果，包含
-			// 服务端删除和新的 Domain/Path/expiry 属性。
-			metadata = cookierefresh.MetadataWithSnapshot(d.MetadataJSON, completeSnapshot)
-		}
-		if // err 用于本次流程后续判断的err
-		err := a.store.Cookies.UpdateRenewalCookie(ctx, d.ID, cookieStr, metadata, time.Now().Unix()); err != nil {
-			a.logger.Warn("轻量续期保存 Cookie 失败", "account", d.ID, "err", err)
-			return err
-		}
-		// valueChanged 用于本次流程后续判断的值Changed
-		valueChanged := cookieStr != current
-		current = cookieStr
-		d.Value = cookieStr
-		d.MetadataJSON = metadata
-		if valueChanged && a.store.Tokens != nil {
-			if // err 用于本次流程后续判断的err
-			err := a.store.Tokens.Clear(ctx, d.ID); err != nil {
-				// Token 仅是运行期缓存；Cookie 已原子提交后不能再把整次
-				// 续期报告成失败，否则调用方可能用旧凭证重试并覆盖新 Jar。
-				a.logger.Warn("轻量续期清理旧 Token 缓存失败", "account", d.ID, "err", err)
-			}
-		}
-		return nil
-	}
 	// 官网始终先由 auto-login plugin 按 havana_lgc_exp/cookie3_bak_exp
 	// 决定是否调用 silentHasLogin。Go 客户端复刻该 HTTP 协议，不加载页面。
 	// runCtx、cancel 用于本次流程后续判断的运行Ctx、cancel
@@ -713,16 +697,8 @@ func (a *Adapter) tryProtocolCredentialRenew(ctx context.Context, d *db.CookiePl
 	// res、err 用于本次流程后续判断的res、err
 	res, err := api.RenewAfterSessionExpired(runCtx, current, cookierefresh.SnapshotFromMetadata(d.MetadataJSON))
 	if res != nil {
-		// completeSnapshot 用于本次流程后续判断的completeSnapshot
-		var completeSnapshot []cookierefresh.BrowserCookie
-		if res.CookieSnapshotComplete {
-			completeSnapshot = res.CookieSnapshot
-			if completeSnapshot == nil {
-				completeSnapshot = []cookierefresh.BrowserCookie{}
-			}
-		}
 		if // saveErr 用于本次流程后续判断的saveErr
-		saveErr := save(res.NewCookies, res.SetCookies, completeSnapshot); saveErr != nil {
+		saveErr := a.persistProtocolRenewalResponse(ctx, d, res); saveErr != nil {
 			return false, saveErr
 		}
 		if res.HasPending() {
@@ -740,16 +716,8 @@ func (a *Adapter) tryProtocolCredentialRenew(ctx context.Context, d *db.CookiePl
 				}
 				return false, errors.New("协议续期底层响应未返回结果")
 			}
-			// lateSnapshot 用于本次流程后续判断的lateSnapshot
-			var lateSnapshot []cookierefresh.BrowserCookie
-			if late.CookieSnapshotComplete {
-				lateSnapshot = late.CookieSnapshot
-				if lateSnapshot == nil {
-					lateSnapshot = []cookierefresh.BrowserCookie{}
-				}
-			}
 			if // saveErr 用于本次流程后续判断的saveErr
-			saveErr := save(late.NewCookies, late.SetCookies, lateSnapshot); saveErr != nil {
+			saveErr := a.persistProtocolRenewalResponse(ctx, d, late); saveErr != nil {
 				return false, saveErr
 			}
 			if waitErr != nil {

@@ -1,8 +1,10 @@
 package automation
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -13,17 +15,19 @@ import (
 
 // fakeAccountTaskClient 用于本次流程后续判断的fake账号任务Client
 type fakeAccountTaskClient struct {
-	pendingCalls  int
-	rateCalls     int
-	polishCalls   int
-	pending       []mtop.PendingRateOrder
-	pendingErr    error
-	rateErr       error
-	items         []mtop.ItemListItem
-	fetchItemsErr error
-	fetchPageSize int
-	fetchMaxPages int
-	polishErr     error
+	pendingCalls int
+	rateCalls    int
+	polishCalls  int
+	pending      []mtop.PendingRateOrder
+	pendingErr   error
+	rateErr      error
+	items        []mtop.ItemListItem
+	// fetchItemsCalls 记录商品列表查询次数，用于确认空列表成功不会触发下一轮调度重试。
+	fetchItemsCalls int
+	fetchItemsErr   error
+	fetchPageSize   int
+	fetchMaxPages   int
+	polishErr       error
 }
 
 // cancelingAccountTaskClient 在评价动作已经返回成功前取消调用方上下文，用于验证补偿收口不会依赖已取消请求。
@@ -61,6 +65,7 @@ func (f *fakeAccountTaskClient) RateBuyer(context.Context, string, string, strin
 
 // FetchAllItems 封装FetchAll商品列表业务协调。
 func (f *fakeAccountTaskClient) FetchAllItems(_ context.Context, _ string, pageSize, maxPages int) (*mtop.ItemListResult, error) {
+	f.fetchItemsCalls++
 	f.fetchPageSize, f.fetchMaxPages = pageSize, maxPages
 	if f.fetchItemsErr != nil {
 		return nil, f.fetchItemsErr
@@ -75,6 +80,55 @@ func (f *fakeAccountTaskClient) PolishItem(context.Context, string, string) (*mt
 		return nil, f.polishErr
 	}
 	return &mtop.AccountTaskResult{Success: true, Message: "ok"}, nil
+}
+
+// seedLocalCompletedOrders 写入已由买家确认收货事件确认的本地订单，供自动评价任务读取而无需查询平台列表。
+func seedLocalCompletedOrders(t *testing.T, store *db.Store, ctx context.Context, orderIDs ...string) {
+	t.Helper()
+	// orderID 表示当前要写入确认收货事实的本地订单标识。
+	for _, orderID := range orderIDs {
+		// upsertErr 保存“已完成”订单事实写入错误；完成时间是自动评价任务的本地消费门槛。
+		upsertErr := store.Orders.Upsert(ctx, orderID, db.OrderUpsertOpts{CookieID: "cid", OrderStatus: "completed"})
+		if upsertErr != nil {
+			t.Fatalf("写入本地已完成订单 %q: %v", orderID, upsertErr)
+		}
+		// markErr 保存确认收货事件时间写入错误，缺少该时间的订单不得触发远端评价。
+		markErr := store.Automation.MarkOrderEventTime(ctx, orderID, "completed_at")
+		if markErr != nil {
+			t.Fatalf("写入确认收货时间 %q: %v", orderID, markErr)
+		}
+	}
+}
+
+// TestScanAccountTasksTreatsEmptyItemListAsSuccess 验证调度扫描拿到空商品列表后完成当日任务且不会重复重试。
+func TestScanAccountTasksTreatsEmptyItemListAsSuccess(t *testing.T) {
+	// store、cleanup 保存扫描测试使用的 SQLite 存储及关闭责任。
+	store, cleanup := newAutomationTestStore(t)
+	defer cleanup()
+	// ctx 是扫描和任务仓储调用共用的上下文。
+	ctx := context.Background()
+	// client 返回成功但为空的商品列表，并记录查询调用次数。
+	client := &fakeAccountTaskClient{}
+	// center 是注入本地平台替身后的自动化中心。
+	center := NewWithDependencies(store, testSenderProvider{sender: &testSender{}}, nil, CenterDependencies{AccountTaskClient: client})
+	// settings 是到达擦亮时间的启用任务配置。
+	settings := db.AccountTaskSettings{CookieID: "cid", AutoPolishEnabled: true, RateContent: "交易愉快", PolishTime: beijingNow().Format("15:04")}
+	// saveErr 保存任务配置写入错误。
+	if saveErr := store.AccountTasks.Upsert(ctx, settings); saveErr != nil {
+		t.Fatal(saveErr)
+	}
+	center.scanAccountTasks(ctx)
+	// firstSettings、firstSettingsErr 保存第一次空列表扫描后写入的当日完成状态。
+	firstSettings, firstSettingsErr := store.AccountTasks.Get(ctx, "cid")
+	if firstSettingsErr != nil || firstSettings.LastPolishDate != beijingNow().Format("2006-01-02") || client.fetchItemsCalls != 1 || client.polishCalls != 0 {
+		t.Fatalf("空列表首次扫描状态错误: settings=%+v fetch=%d polish=%d err=%v", firstSettings, client.fetchItemsCalls, client.polishCalls, firstSettingsErr)
+	}
+	center.scanAccountTasks(ctx)
+	// secondSettings、secondSettingsErr 保存第二次扫描后的状态，确认成功日期阻止重复商品列表请求。
+	secondSettings, secondSettingsErr := store.AccountTasks.Get(ctx, "cid")
+	if secondSettingsErr != nil || secondSettings.LastPolishDate != firstSettings.LastPolishDate || client.fetchItemsCalls != 1 || client.polishCalls != 0 {
+		t.Fatalf("空列表成功后不应重试: settings=%+v fetch=%d polish=%d err=%v", secondSettings, client.fetchItemsCalls, client.polishCalls, secondSettingsErr)
+	}
 }
 
 // TestAccountTaskRateIsOrderIdempotent 封装Test账号任务RateIs订单Idempotent业务协调。
@@ -93,6 +147,7 @@ func TestAccountTaskRateIsOrderIdempotent(t *testing.T) {
 		RateContent: "交易愉快", PolishTime: "03:00"}); err != nil {
 		t.Fatal(err)
 	}
+	seedLocalCompletedOrders(t, store, ctx, "order-1", "order-2")
 	// first、err 用于本次流程后续判断的first、err
 	first, err := center.RunAccountTask(ctx, "cid", TaskAutoRate)
 	if err != nil || first.Success != 2 || client.rateCalls != 2 {
@@ -105,6 +160,51 @@ func TestAccountTaskRateIsOrderIdempotent(t *testing.T) {
 	}
 }
 
+// TestAccountTaskRatePermanentPlatformFailureStopsFutureRequests 验证平台明确返回超期不可评价后只请求一次并永久跳过该订单。
+func TestAccountTaskRatePermanentPlatformFailureStopsFutureRequests(t *testing.T) {
+	// store、cleanup 保存本测试使用的 SQLite 自动化存储及关闭责任。
+	store, cleanup := newAutomationTestStore(t)
+	defer cleanup()
+	// ctx 是自动评价永久失败测试共用的数据库上下文。
+	ctx := context.Background()
+	// expiredErr 保存平台明确拒绝超过 30 天订单的业务错误。
+	expiredErr := &mtop.MTopResponseError{API: "mtop.taobao.idle.rate.create", Kind: mtop.MTopErrorBusiness,
+		Ret: []string{"FAIL_BIZ_BAD_REQUEST::超出30天的订单不允许评价||rate failed"}}
+	// client 模拟待评价列表持续返回同一超期订单，并统计评价请求次数。
+	client := &fakeAccountTaskClient{pending: []mtop.PendingRateOrder{{TradeID: "expired-order"}}, rateErr: expiredErr}
+	// center 是注入平台错误替身后的自动化中心。
+	center := NewWithDependencies(store, testSenderProvider{sender: &testSender{}}, nil, CenterDependencies{AccountTaskClient: client})
+	// settingsErr 保存自动评价设置写入错误。
+	if settingsErr := store.AccountTasks.Upsert(ctx, db.AccountTaskSettings{CookieID: "cid", AutoRateEnabled: true,
+		RateContent: "交易愉快", PolishTime: "03:00"}); settingsErr != nil {
+		t.Fatal(settingsErr)
+	}
+	seedLocalCompletedOrders(t, store, ctx, "expired-order")
+	// firstSummary、firstErr 保存首次识别永久失败后的执行结果。
+	firstSummary, firstErr := center.RunAccountTask(ctx, "cid", TaskAutoRate)
+	if firstErr != nil || firstSummary.Failed != 1 || client.rateCalls != 1 {
+		t.Fatalf("首次超期评价结果错误: summary=%+v calls=%d err=%v", firstSummary, client.rateCalls, firstErr)
+	}
+	// status、message、nextRetryAt 保存永久失败运行记录的状态、原因和下一次重试时间。
+	var status, message string
+	// nextRetryAt 保存永久失败运行记录的下一次自动执行时间，永久失败必须保持为零。
+	var nextRetryAt int64
+	// queryErr 保存读取永久失败运行记录的数据库错误。
+	queryErr := store.DB.QueryRowContext(ctx, `SELECT status,error_message,next_retry_at FROM account_task_runs WHERE run_key=?`,
+		"rate:cid:expired-order").Scan(&status, &message, &nextRetryAt)
+	if queryErr != nil {
+		t.Fatal(queryErr)
+	}
+	if status != "failed" || !strings.HasPrefix(message, db.NoRetryErrorPrefix) || !strings.Contains(message, "超出30天的订单不允许评价") || nextRetryAt != 0 {
+		t.Fatalf("永久失败运行记录错误: status=%q message=%q next_retry_at=%d", status, message, nextRetryAt)
+	}
+	// secondSummary、secondErr 保存后续扫描跳过永久失败订单的结果。
+	secondSummary, secondErr := center.RunAccountTask(ctx, "cid", TaskAutoRate)
+	if secondErr != nil || secondSummary.Skipped != 1 || client.rateCalls != 1 {
+		t.Fatalf("超期订单后续不应再次请求评价: summary=%+v calls=%d err=%v", secondSummary, client.rateCalls, secondErr)
+	}
+}
+
 // TestScanAccountTasksRunsEnabledRateConfiguration 验证账号任务扫描器发现启用配置后执行自动评价。
 func TestScanAccountTasksRunsEnabledRateConfiguration(t *testing.T) {
 	// store、cleanup 保存本测试使用的 SQLite 自动化存储及关闭责任。
@@ -114,17 +214,24 @@ func TestScanAccountTasksRunsEnabledRateConfiguration(t *testing.T) {
 	ctx := context.Background()
 	// client 保存扫描器使用的本地账号任务平台替身。
 	client := &fakeAccountTaskClient{pending: []mtop.PendingRateOrder{{TradeID: "scan-order"}}}
+	// logs 捕获扫描器的脱敏完成日志，验证下一轮成功状态可被观察。
+	var logs bytes.Buffer
 	// center 保存注入账号任务平台替身的自动化中心。
-	center := NewWithDependencies(store, testSenderProvider{sender: &testSender{}}, nil, CenterDependencies{AccountTaskClient: client})
+	center := NewWithDependencies(store, testSenderProvider{sender: &testSender{}},
+		slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})), CenterDependencies{AccountTaskClient: client})
 	// settings 保存应被扫描器发现的启用账号任务配置。
 	settings := db.AccountTaskSettings{CookieID: "cid", AutoRateEnabled: true, RateContent: "交易愉快", PolishTime: "03:00"}
 	// saveErr 保存账号任务配置写入错误。
 	if saveErr := store.AccountTasks.Upsert(ctx, settings); saveErr != nil {
 		t.Fatal(saveErr)
 	}
+	seedLocalCompletedOrders(t, store, ctx, "scan-order")
 	center.scanAccountTasks(ctx)
-	if client.pendingCalls != 1 || client.rateCalls != 1 {
-		t.Fatalf("扫描器未执行评价任务 pending=%d rate=%d", client.pendingCalls, client.rateCalls)
+	if client.pendingCalls != 0 || client.rateCalls != 1 {
+		t.Fatalf("扫描器不应扫描平台待评价列表 pending=%d rate=%d", client.pendingCalls, client.rateCalls)
+	}
+	if !strings.Contains(logs.String(), "自动评价扫描完成") || !strings.Contains(logs.String(), "success=1") {
+		t.Fatalf("缺少自动评价完成日志: %s", logs.String())
 	}
 	// emptyCoordinator 保存未装配客户端时应安全返回的扫描器。
 	emptyCoordinator := &accountTaskCoordinator{client: func() AccountTaskClient { return nil }}
@@ -154,6 +261,7 @@ func TestAccountTaskRateFinishFailureQuarantinesExternalSuccess(t *testing.T) {
 		RateContent: "交易愉快", PolishTime: "03:00"}); settingsErr != nil {
 		t.Fatal(settingsErr)
 	}
+	seedLocalCompletedOrders(t, store, ctx, "order-finish-failure")
 	// runErr 保存外部动作成功但本地运行结果收口失败后的人工核对错误。
 	_, runErr := center.RunAccountTask(ctx, "cid", TaskAutoRate)
 	if !errors.Is(runErr, errAutomationNeedsReview) || !strings.Contains(runErr.Error(), "保存账号任务运行结果失败") {
@@ -200,6 +308,7 @@ func TestAccountTaskRateFinishAndQuarantineFailureJoinsErrors(t *testing.T) {
 		RateContent: "交易愉快", PolishTime: "03:00"}); settingsErr != nil {
 		t.Fatal(settingsErr)
 	}
+	seedLocalCompletedOrders(t, store, ctx, "order-double-failure")
 	// runErr 保存结果写入和隔离写入均失败后的组合错误。
 	_, runErr := center.RunAccountTask(ctx, "cid", TaskAutoRate)
 	if !errors.Is(runErr, errAutomationNeedsReview) || !strings.Contains(runErr.Error(), "保存账号任务运行结果失败") ||
@@ -223,6 +332,7 @@ func TestAccountTaskRateCancellationQuarantinesAndBlocksRetry(t *testing.T) {
 		RateContent: "交易愉快", PolishTime: "03:00"}); settingsErr != nil {
 		t.Fatal(settingsErr)
 	}
+	seedLocalCompletedOrders(t, store, setupCtx, "order-cancelled")
 	// requestCtx、cancel 模拟外部动作完成后被上层请求取消的生命周期。
 	requestCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -314,7 +424,7 @@ func TestAccountTaskSessionExpiredRecoversOnceAndBlocksFurtherAPIRequests(t *tes
 	// sessionErr 用于本次流程后续判断的会话Err
 	sessionErr := &mtop.SessionExpiredError{API: "自动评价接口", Ret: []string{"FAIL_SYS_SESSION_EXPIRED::Session过期"}}
 	// client 用于本次流程后续判断的client
-	client := &fakeAccountTaskClient{pendingErr: sessionErr}
+	client := &fakeAccountTaskClient{rateErr: sessionErr}
 	// recoverer 用于本次流程后续判断的recoverer
 	recoverer := &fakeCredentialRecoverer{store: store, fail: true}
 	// center 用于本次流程后续判断的center
@@ -327,33 +437,34 @@ func TestAccountTaskSessionExpiredRecoversOnceAndBlocksFurtherAPIRequests(t *tes
 		RateContent: "交易愉快", PolishTime: "03:00"}); err != nil {
 		t.Fatal(err)
 	}
+	seedLocalCompletedOrders(t, store, ctx, "session-order")
 
 	if // err 用于本次流程后续判断的err
 	_, err := center.RunAccountTask(ctx, "cid", TaskAutoRate); err == nil || !mtop.IsSessionExpiredErr(err) {
 		t.Fatalf("首次 session 失效应触发续期并返回原始分类错误: %v", err)
 	}
-	if client.pendingCalls != 1 || recoverer.calls != 1 {
-		t.Fatalf("first calls: api=%d recover=%d want 1/1", client.pendingCalls, recoverer.calls)
+	if client.rateCalls != 1 || recoverer.calls != 1 {
+		t.Fatalf("first calls: rate=%d recover=%d want 1/1", client.rateCalls, recoverer.calls)
 	}
 	if // err 用于本次流程后续判断的err
 	_, err := center.RunAccountTask(ctx, "cid", TaskAutoRate); err == nil || !strings.Contains(err.Error(), "已停止自动化 API 请求") {
 		t.Fatalf("未更新凭证时应保持阻断: %v", err)
 	}
-	if client.pendingCalls != 1 || recoverer.calls != 1 {
-		t.Fatalf("blocked run must not call API/recovery again: api=%d recover=%d", client.pendingCalls, recoverer.calls)
+	if client.rateCalls != 1 || recoverer.calls != 1 {
+		t.Fatalf("blocked run must not call API/recovery again: rate=%d recover=%d", client.rateCalls, recoverer.calls)
 	}
 
 	if // err 用于本次流程后续判断的err
 	err := store.Cookies.UpdateValueExisting(ctx, "cid", "unb=1; _m_h5_tk=fresh_1; renewed=1"); err != nil {
 		t.Fatal(err)
 	}
-	client.pendingErr = nil
+	client.rateErr = nil
 	if // err 用于本次流程后续判断的err
 	_, err := center.RunAccountTask(ctx, "cid", TaskAutoRate); err != nil {
 		t.Fatalf("凭证变化后应自动解除阻断: %v", err)
 	}
-	if client.pendingCalls != 2 {
-		t.Fatalf("api calls after credential update=%d want 2", client.pendingCalls)
+	if client.rateCalls != 1 {
+		t.Fatalf("凭证变化后失败订单仍在冷却期，不应再次评价 rate=%d", client.rateCalls)
 	}
 }
 
@@ -383,6 +494,7 @@ func TestAccountTaskStopsRemainingOrdersOnSessionExpired(t *testing.T) {
 		RateContent: "交易愉快", PolishTime: "03:00"}); err != nil {
 		t.Fatal(err)
 	}
+	seedLocalCompletedOrders(t, store, ctx, "order-1", "order-2")
 
 	if // err 用于本次流程后续判断的err
 	_, err := center.RunAccountTask(ctx, "cid", TaskAutoRate); err == nil {
@@ -390,6 +502,75 @@ func TestAccountTaskStopsRemainingOrdersOnSessionExpired(t *testing.T) {
 	}
 	if client.rateCalls != 1 || recoverer.calls != 1 {
 		t.Fatalf("remaining orders must stop immediately: rate=%d recover=%d", client.rateCalls, recoverer.calls)
+	}
+}
+
+// TestAccountTaskStopsRemainingOrdersOnMTopTokenExpired 验证 Token 内部刷新耗尽后停止当前批次，但不恢复账号；t 管理本地 SQLite。
+func TestAccountTaskStopsRemainingOrdersOnMTopTokenExpired(t *testing.T) {
+	// store、cleanup 用于 Token 失效恢复测试的 SQLite 存储及关闭责任。
+	store, cleanup := newAutomationTestStore(t)
+	defer cleanup()
+	// ctx 用于任务与凭证恢复调用共用的上下文。
+	ctx := context.Background()
+	// tokenErr 模拟业务请求经过自身 Token 重试后仍无法恢复的错误。
+	tokenErr := &mtop.MTopResponseError{API: "评价接口", Kind: mtop.MTopErrorTokenExpired, HTTPStatus: 200}
+	// client 预置两个订单，确认第一个 Token 失效后不会继续消费第二个订单。
+	client := &fakeAccountTaskClient{
+		pending: []mtop.PendingRateOrder{{TradeID: "order-1"}, {TradeID: "order-2"}},
+		rateErr: tokenErr,
+	}
+	// recoverer 记录 Token 失效后触发的统一凭证恢复。
+	recoverer := &fakeCredentialRecoverer{store: store}
+	// center 注入任务客户端和凭证恢复器。
+	center := NewWithDependencies(store, testSenderProvider{sender: &testSender{}}, nil, CenterDependencies{
+		AccountTaskClient:  client,
+		OrderDetailFetcher: recoverer,
+	})
+	// err 表示写入自动评价任务配置时的数据库错误。
+	if err := store.AccountTasks.Upsert(ctx, db.AccountTaskSettings{CookieID: "cid", AutoRateEnabled: true, RateContent: "交易愉快", PolishTime: "03:00"}); err != nil {
+		t.Fatal(err)
+	}
+	seedLocalCompletedOrders(t, store, ctx, "order-1", "order-2")
+	// err 表示运行自动评价任务后保留的凭证失效错误。
+	if _, err := center.RunAccountTask(ctx, "cid", TaskAutoRate); err == nil || !mtop.IsMTopTokenExpiredErr(err) {
+		t.Fatalf("Token 失效应返回原始分类错误: %v", err)
+	}
+	if client.rateCalls != 1 || recoverer.calls != 0 {
+		t.Fatalf("Token 失效后必须停止剩余订单且不得恢复账号: rate=%d recover=%d", client.rateCalls, recoverer.calls)
+	}
+}
+
+// TestAccountTaskStopsRemainingOrdersOnRiskVerification 验证一次评价动作触发风控后，当前本地批次不会继续请求其他订单。
+func TestAccountTaskStopsRemainingOrdersOnRiskVerification(t *testing.T) {
+	// store、cleanup 保存风控停止测试使用的 SQLite 存储及其释放函数。
+	store, cleanup := newAutomationTestStore(t)
+	defer cleanup()
+	// ctx 是本轮本地订单事实和自动评价任务共用的上下文。
+	ctx := context.Background()
+	// riskErr 模拟平台在评价动作时要求安全验证，而非可立即刷新的普通 Token 失效。
+	riskErr := &mtop.RiskVerificationError{API: "评价接口", Ret: []string{"FAIL_SYS_USER_VALIDATE::RGV587_ERROR"}}
+	// client 返回风控错误，并保留调用次数以确认第二个订单未触达平台。
+	client := &fakeAccountTaskClient{rateErr: riskErr}
+	// recoverer 记录统一凭证恢复调用次数；风控不允许触发该恢复路径。
+	recoverer := &fakeCredentialRecoverer{store: store}
+	// center 注入评价客户端和凭证恢复器。
+	center := NewWithDependencies(store, testSenderProvider{sender: &testSender{}}, nil, CenterDependencies{
+		AccountTaskClient:  client,
+		OrderDetailFetcher: recoverer,
+	})
+	// settingsErr 保存自动评价任务配置写入错误。
+	settingsErr := store.AccountTasks.Upsert(ctx, db.AccountTaskSettings{CookieID: "cid", AutoRateEnabled: true, RateContent: "交易愉快", PolishTime: "03:00"})
+	if settingsErr != nil {
+		t.Fatal(settingsErr)
+	}
+	seedLocalCompletedOrders(t, store, ctx, "risk-order-1", "risk-order-2")
+	// summary、runErr 保存风控动作后的任务统计和原始错误。
+	summary, runErr := center.RunAccountTask(ctx, "cid", TaskAutoRate)
+	if !mtop.IsRiskVerificationErr(runErr) || summary.Failed != 1 {
+		t.Fatalf("风控结果应保留分类且记录首单失败: summary=%+v err=%v", summary, runErr)
+	}
+	if client.rateCalls != 1 || recoverer.calls != 0 {
+		t.Fatalf("风控后不得继续评价或续期: rate=%d recover=%d", client.rateCalls, recoverer.calls)
 	}
 }
 
@@ -504,8 +685,8 @@ func TestPolishDueHonorsConfiguredTimeAndDate(t *testing.T) {
 	}
 }
 
-// TestAccountTaskPolishEmptyItemListDoesNotLockDay 验证未获取到在售商品时保留同日重试机会，商品恢复后仍可正常擦亮。
-func TestAccountTaskPolishEmptyItemListDoesNotLockDay(t *testing.T) {
+// TestAccountTaskPolishEmptyItemListCompletesDay 验证成功获取空商品列表时完成当日任务且不重复请求平台。
+func TestAccountTaskPolishEmptyItemListCompletesDay(t *testing.T) {
 	// store、cleanup 保存内存测试数据库及其清理函数。
 	store, cleanup := newAutomationTestStore(t)
 	defer cleanup()
@@ -521,19 +702,19 @@ func TestAccountTaskPolishEmptyItemListDoesNotLockDay(t *testing.T) {
 	}
 	// first、firstErr 分别是空商品列表时的运行摘要和不应出现的业务错误。
 	first, firstErr := center.RunAccountTask(ctx, "cid", TaskAutoPolish)
-	if firstErr != nil || first.Found != 0 || first.Success != 0 || client.polishCalls != 0 || first.Message == "" {
+	if firstErr != nil || first.Found != 0 || first.Success != 0 || first.Failed != 0 || first.Skipped != 0 || client.polishCalls != 0 || first.Message == "" {
 		t.Fatalf("first=%+v calls=%d err=%v", first, client.polishCalls, firstErr)
 	}
-	// settings、settingsErr 分别是空列表运行后的账号任务设置和读取错误；当天日期必须保持为空。
+	// settings、settingsErr 分别是空列表运行后的账号任务设置和读取错误；当天日期必须已经标记完成。
 	settings, settingsErr := store.AccountTasks.Get(ctx, "cid")
-	if settingsErr != nil || settings.LastPolishDate != "" {
-		t.Fatalf("空商品运行不能写入擦亮日期: settings=%+v err=%v", settings, settingsErr)
+	if settingsErr != nil || settings.LastPolishDate != beijingNow().Format("2006-01-02") || settings.LastPolishAt <= 0 {
+		t.Fatalf("空商品运行必须写入擦亮日期: settings=%+v err=%v", settings, settingsErr)
 	}
-	// client.items 模拟商品列表恢复，手动执行必须立即重新领取失败运行并实际擦亮。
+	// client.items 模拟商品列表恢复；同日再次执行必须被成功运行记录跳过，而不是重复擦亮。
 	client.items = []mtop.ItemListItem{{ID: "item-1"}}
-	// second、secondErr 分别是商品恢复后的运行摘要和不应出现的错误。
+	// second、secondErr 分别是同日重复运行的摘要和不应出现的错误。
 	second, secondErr := center.RunAccountTask(ctx, "cid", TaskAutoPolish)
-	if secondErr != nil || second.Success != 1 || client.polishCalls != 1 {
+	if secondErr != nil || second.Skipped != 1 || client.polishCalls != 0 {
 		t.Fatalf("second=%+v calls=%d err=%v", second, client.polishCalls, secondErr)
 	}
 }

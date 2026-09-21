@@ -37,6 +37,7 @@ func (r eventFactRecorder) record(ctx context.Context, task Task) error {
 		SpecValue:   task.SpecValue,
 		Quantity:    task.Quantity,
 		Amount:      task.Amount,
+		IsBargain:   confirmedBargainPointer(task.IsBargain),
 	}); err != nil {
 		return fmt.Errorf("记录自动化事件订单事实: %w", err)
 	}
@@ -46,13 +47,33 @@ func (r eventFactRecorder) record(ctx context.Context, task Task) error {
 		err := r.store.Automation.MarkOrderEventTime(ctx, task.OrderID, "paid_at"); err != nil {
 			return fmt.Errorf("记录订单付款时间: %w", err)
 		}
+		if task.IsBargain {
+			// readyErr 保存最终成功小刀阶段事实的写入错误，供最终卡片丢失时的安全兜底使用。
+			if readyErr := r.store.Automation.MarkBargainReady(ctx, task.OrderID, task.AccountID); readyErr != nil {
+				return fmt.Errorf("记录成功小刀阶段: %w", readyErr)
+			}
+		}
 	case TriggerBuyerReviewed:
 		if // err 用于本次流程后续判断的err
 		err := r.store.Automation.MarkOrderEventTime(ctx, task.OrderID, "buyer_reviewed_at"); err != nil {
 			return fmt.Errorf("记录买家评价时间: %w", err)
 		}
+	case TriggerOrderCompleted:
+		if // err 保存买家确认收货后订单完成时间写入错误。
+		err := r.store.Automation.MarkOrderEventTime(ctx, task.OrderID, "completed_at"); err != nil {
+			return fmt.Errorf("记录订单完成时间: %w", err)
+		}
 	}
 	return nil
+}
+
+// confirmedBargainPointer 只把事件明确识别出的砍价事实写回订单；普通事件不携带“非砍价”的权威结论，
+// 因而返回 nil 以保留订单同步或先前砍价事件已经持久化的保护标记。
+func confirmedBargainPointer(value bool) *bool {
+	if !value {
+		return nil
+	}
+	return &value
 }
 
 // ruleMatcher 只查询适用于任务的规则，不执行规则动作或修改运行状态。
@@ -98,6 +119,23 @@ func (m ruleMatcher) match(ctx context.Context, task Task) ([]db.AutomationRule,
 // 计划过程不得访问数据库、发送网络请求或修改规则。
 // actionPlanner 用于本次流程后续判断的动作Planner
 type actionPlanner struct{}
+
+// ruleAllowsAllItems 判断规则是否明确授权账号级付款发货动作适用于全部商品。
+// 只有账号级 order_paid 规则的 JSON 布尔值为 true 时才返回 true，避免把商品级或旧规则误当通配规则。
+func ruleAllowsAllItems(rule db.AutomationRule, triggerType string) bool {
+	if triggerType != TriggerOrderPaid || rule.TriggerType != TriggerOrderPaid || rule.ItemID != "" {
+		return false
+	}
+	// scope 保存规则中由用户明确确认的全商品适用范围。
+	var scope struct {
+		// AllowAllItems 表示账号级发货内容是否经过用户确认可用于全部商品。
+		AllowAllItems bool `json:"allow_all_items"`
+	}
+	if json.Unmarshal([]byte(rule.ConfigJSON), &scope) != nil {
+		return false
+	}
+	return scope.AllowAllItems
+}
 
 // isDeliveryAction 判断动作是否会产生订单发货消息。
 func isDeliveryAction(action db.AutomationAction) bool {

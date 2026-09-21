@@ -1,6 +1,6 @@
 import { expect,test } from 'vitest';
 import type { NotificationChannel } from './api';
-import { buildNotificationPayload,emptyNotificationForm,isCurrentNotificationRequest,normalizeNotificationForm,notificationErrorMessage,notificationEventSummary,validateNotificationForm } from './state';
+import { buildNotificationPayload,emptyNotificationForm,isCurrentNotificationRequest,normalizeNotificationForm,notificationErrorMessage,notificationEventSummary,notificationEvents,validateNotificationForm } from './state';
 import type { NotificationForm } from './types';
 
 // createForm 创建通知渠道校验使用的最小表单对象。
@@ -22,6 +22,24 @@ test('通知事件摘要为空时表示订阅全部事件',
   () => {
     expect(notificationEventSummary([])).toBe('全部事件');
     expect(notificationEventSummary(['account_offline', 'system_error'])).toBe('掉线通知、系统错误');
+  });
+
+test('旧版统一交易开关归一为自动化与人工处理开关',
+  // 兼容测试验证旧渠道编辑后会展开四个自动化事件及人工处理事件。
+  () => {
+  // legacyChannel 是保存过旧版交易事件编码的渠道摘要。
+  const legacyChannel = { id: 'legacy-channel', ...createForm({ event_types: ['delivery_result'] }) } as NotificationChannel;
+  // normalized 是编辑器展示的细分事件集合。
+  const normalized = normalizeNotificationForm(legacyChannel, {});
+  expect(normalized.event_types).toEqual(expect.arrayContaining([
+    'automation_order_created', 'automation_order_paid', 'automation_buyer_reviewed', 'automation_review_missing_timeout',
+    'manual_delivery_result', 'manual_intervention_required',
+  ]));
+  expect(notificationEvents.filter(
+    // event 是当前通知事件定义，用于统计自动化任务类别数量。
+    event => event.value.startsWith('automation_'),
+  )).toHaveLength(4);
+  expect(notificationEventSummary(['manual_intervention_required'])).toBe('需要人工处理');
   });
 
 test('通知请求代次拒绝过期响应',
@@ -51,3 +69,15 @@ test('通知表单覆盖各渠道归一化和独立 SMTP 校验',
     expect(notificationErrorMessage(new Error('网络失败'), '备用错误')).toBe('网络失败');
     expect(notificationErrorMessage({}, '备用错误')).toBe('备用错误');
   });
+
+// 原有 SMTP 保留模式只发送收件地址，明确重新配置时才发送完整 SMTP 配置。
+test('邮件编辑保留现有 SMTP，显式替换仍需完整配置', /* preservedSMTPTest 验证表单状态与请求载荷边界。 */ () => {
+  // form 模拟旧版独立 SMTP 渠道，只在浏览器内保存非秘密编辑值。
+  const form = createForm({ type: 'email', preserveSMTP: true, config: { to_email: 'new@example.com', use_custom_smtp: true } });
+  expect(validateNotificationForm(form)).toBe('');
+  expect(buildNotificationPayload(form)).toMatchObject({ email_recipient: 'new@example.com' });
+  expect(buildNotificationPayload(form).config).toBeUndefined();
+  expect(validateNotificationForm({ ...form, preserveSMTP: false })).toContain('SMTP 服务器');
+  expect(validateNotificationForm({ ...form, config: {} })).toContain('收件邮箱');
+  expect(buildNotificationPayload({ ...form, preserveSMTP: false, config: { to_email: 'new@example.com', use_custom_smtp: false } })).toMatchObject({ config: { to_email: 'new@example.com', use_custom_smtp: false } });
+});

@@ -147,6 +147,7 @@ type AuthenticationPort interface {
 	VerifyPassword(context.Context, string, string) (accountapp.AuthUser, bool, error)
 	UpdatePassword(context.Context, string, string) (bool, error)
 	UpdateCredentials(context.Context, int64, string, string) error
+	ValidateSession(context.Context, string, int64) error
 }
 
 // LoginAuditPort 定义账号登录成功后的审计能力。
@@ -183,6 +184,8 @@ type AccountSettingsPort interface {
 	UpdateLoginInfo(context.Context, accountapp.LoginInfoUpdateInput) error
 	SetStatus(context.Context, int64, string, bool) (accountapp.StatusResult, error)
 	SetAutoConfirm(context.Context, int64, string, bool) (accountapp.SettingsResult, error)
+	SetAutoConsign(context.Context, int64, string, bool) (accountapp.SettingsResult, error)
+	SetAutoBargain(context.Context, int64, string, bool) (accountapp.SettingsResult, error)
 	SetRemark(context.Context, int64, string, string) (accountapp.SettingsResult, error)
 	SetPause(context.Context, int64, string, int) (accountapp.SettingsResult, error)
 	GetPause(context.Context, int64, string) (accountapp.PauseState, error)
@@ -232,6 +235,7 @@ type ChatPort interface {
 	CleanupEmptySessions(context.Context, string) error
 	OwnsAccount(context.Context, int64, string) (bool, error)
 	MarkRead(context.Context, int64, string, string) error
+	DeleteConversation(context.Context, int64, string, string) error
 	ReportPlatformRead(context.Context, string, string, []map[string]any) error
 	ResolveSessionIdentity(context.Context, chatapp.Session) (chatapp.Session, error)
 	RefreshSessionIdentities(context.Context, string, []chatapp.Session) ([]chatapp.Session, error)
@@ -251,6 +255,7 @@ type UncertainNotificationsPort interface {
 // NotificationChannelsPort 定义通知渠道和账号绑定的管理能力。
 type NotificationChannelsPort interface {
 	ListChannels(context.Context, int64) ([]notificationsapp.ChannelSummary, error)
+	GetChannelEditor(context.Context, int64, int64) (notificationsapp.ChannelEditor, error)
 	CreateChannel(context.Context, int64, notificationsapp.ChannelInput) (int64, error)
 	UpdateChannel(context.Context, int64, int64, notificationsapp.ChannelPatch) error
 	DeleteChannel(context.Context, int64, int64) error
@@ -356,6 +361,7 @@ type SettingsPort interface {
 	GetAIReply(context.Context, int64, string) (settingsapp.AIReplySettings, error)
 	UpsertAIReply(context.Context, int64, string, settingsapp.AIReplySettings) error
 	ListAIModels(context.Context, int64, string, string) ([]string, error)
+	TestAIConnection(context.Context, int64, string, string, string) (settingsapp.AIConnectionTestResult, error)
 }
 
 // AdminPort 定义管理员用户与统计能力。

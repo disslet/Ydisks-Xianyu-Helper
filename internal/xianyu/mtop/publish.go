@@ -55,12 +55,32 @@ type PublishError struct {
 // Error 封装错误业务协调。
 func (e *PublishError) Error() string {
 	if len(e.Ret) > 0 {
-		return strings.Join(e.Ret, "; ")
+		return strings.Join(sanitizeMTopRet(e.Ret), "; ")
 	}
 	if e.Body != "" {
-		return truncate(e.Body, 240)
+		return truncate(sanitizeMTopText(e.Body), 240)
 	}
 	return string(e.Code)
+}
+
+// sanitizeMTopRet 脱敏发布错误中的平台 ret，并保持发布错误的历史分隔格式。
+func sanitizeMTopRet(ret []string) []string {
+	// values 保存非空且已脱敏的平台错误条目。
+	values := make([]string, 0, len(ret))
+	// value 表示当前发布响应中的单条平台错误标记。
+	for _, value := range ret {
+		// item 保存当前平台错误条目的安全文本。
+		item := strings.TrimSpace(sanitizeMTopText(value))
+		if item != "" {
+			values = append(values, item)
+		}
+	}
+	return values
+}
+
+// isPublishTokenFailure 判断发布流程是否因 MTOP Token 过期或刷新失败而终止。
+func isPublishTokenFailure(err error) bool {
+	return IsMTopTokenExpiredErr(err)
 }
 
 // PublishImage 用于本次流程后续判断的发布图片
@@ -117,6 +137,12 @@ type PublishItemRequest struct {
 	PreferredCategory *PublishCategory
 	Location          *PublishLocation
 	Images            []PublishImage
+	// Specs 是多规格商品的规格维度；为空时按单规格发布。
+	Specs []PublishSpec
+	// SKUs 是规格组合的逐行价格和库存。
+	SKUs []PublishSKU
+	// SpecImages 是规格值图片，规格值通过 ImageIndex 引用。
+	SpecImages []PublishImage
 	// BeforePublish 在图片上传和类目准备完成后、最终商品发布请求发出前执行，可响应批次节流取消。
 	BeforePublish func(context.Context) error
 }
@@ -150,7 +176,7 @@ func (c *ClientImpl) PublishItem(ctx context.Context, cookiesStr string, req Pub
 	if strings.TrimSpace(req.Description) == "" {
 		req.Description = req.Title
 	}
-	if req.PriceCents <= 0 {
+	if len(req.Specs) == 0 && req.PriceCents <= 0 {
 		return nil, errors.New("商品价格必须大于 0")
 	}
 	if req.Quantity <= 0 {
@@ -161,6 +187,13 @@ func (c *ClientImpl) PublishItem(ctx context.Context, cookiesStr string, req Pub
 	}
 	if len(req.Images) > 9 {
 		return nil, errors.New("商品图片最多 9 张")
+	}
+	// err 表示规格、SKU 和规格图片引用的校验结果。
+	if err := validatePublishSKUs(req.Specs, req.SKUs, len(req.SpecImages)); err != nil {
+		return nil, err
+	}
+	if len(req.SKUs) > 0 {
+		req.Quantity = publishSKUQuantity(req.SKUs)
 	}
 	if req.PreferredCategory != nil && !validPublishCategory(*req.PreferredCategory) {
 		return nil, errors.New("默认类目必须同时包含类目 ID、类目名称和频道类目 ID")
@@ -184,6 +217,20 @@ func (c *ClientImpl) PublishItem(ctx context.Context, cookiesStr string, req Pub
 			currentCookies = updated
 		}
 		uploaded = append(uploaded, res)
+	}
+	// uploadedSpecImages 保存规格值图片上传后的平台地址，顺序与请求图片索引一致。
+	uploadedSpecImages := make([]uploadedImage, 0, len(req.SpecImages))
+	// img 表示当前待上传的规格值图片。
+	for _, img := range req.SpecImages {
+		// res、updated、err 保存当前规格图片的上传结果、Cookie 更新和错误。
+		res, updated, err := c.uploadPublishImage(ctx, currentCookies, img)
+		if err != nil {
+			return nil, err
+		}
+		if updated != "" {
+			currentCookies = updated
+		}
+		uploadedSpecImages = append(uploadedSpecImages, res)
 	}
 	// category 用于本次流程后续判断的分类
 	var category map[string]any
@@ -212,7 +259,10 @@ func (c *ClientImpl) PublishItem(ctx context.Context, cookiesStr string, req Pub
 			return nil, err
 		}
 	}
-	return c.publishItemOnce(ctx, currentCookies, req, uploaded, category)
+	// publishCtx、publishCancel 为最终发布 HTTP 请求创建独立的两分钟网络超时预算，不计入前置节流等待。
+	publishCtx, publishCancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer publishCancel()
+	return c.publishItemOnce(publishCtx, currentCookies, req, uploaded, uploadedSpecImages, category)
 }
 
 // RecommendPublishCategory 根据关键词调用闲鱼推荐接口，返回可直接用于发布的完整类目。
@@ -366,10 +416,26 @@ func (c *ClientImpl) recommendPublishCategory(ctx context.Context, cookiesStr, t
 	// decoded、updated、err 用于本次流程后续判断的decoded、updated、err
 	decoded, updated, err := c.callMTop(ctx, cookiesStr, RecommendItemAPI, "mtop.taobao.idle.kgraph.property.recommend", "2.0", "a21ybx.publish.0.0", "a21ybx.item.sidebar.1.67321598K9Vgx8", "67321598K9Vgx8", data)
 	if err != nil {
+		if isPublishTokenFailure(err) {
+			return nil, updated, &PublishError{Code: PublishErrorTokenExpired, Body: err.Error()}
+		}
 		return nil, updated, err
 	}
 	if !hasMTopSuccess(retFromDecoded(decoded)) {
-		return nil, updated, classifyPublishError(retFromDecoded(decoded), decoded)
+		// classifiedPublishErr 保存发布域能够从无错误码文本中识别出的既有专用错误，例如库存权限不足。
+		classifiedPublishErr := classifyPublishError(retFromDecoded(decoded), decoded)
+		// publishErr 是发布域专用错误视图；已知专用码优先于通用未知系统分类。
+		var publishErr *PublishError
+		if errors.As(classifiedPublishErr, &publishErr) && publishErr.Code != PublishErrorUnknown {
+			return nil, updated, classifiedPublishErr
+		}
+		// failure 保存推荐接口的统一平台失败分类；普通库存/权限错误继续由旧发布错误码兼容处理。
+		failure := c.mtopResponseFailure("mtop.taobao.idle.kgraph.property.recommend", http.StatusOK, retFromDecoded(decoded), "平台 ret 未包含 SUCCESS")
+		// kind、ok 保存推荐接口失败分类及其是否存在。
+		if kind, ok := MTopErrorKindOf(failure); ok && kind != MTopErrorBusiness {
+			return nil, updated, failure
+		}
+		return nil, updated, classifiedPublishErr
 	}
 	// dataMap 用于本次流程后续判断的数据Map
 	dataMap := mapFromAny(decoded["data"])
@@ -477,7 +543,7 @@ func validPublishLocation(loc PublishLocation) bool {
 }
 
 // publishItemOnce 封装发布商品Once业务协调。
-func (c *ClientImpl) publishItemOnce(ctx context.Context, cookiesStr string, req PublishItemRequest, images []uploadedImage, category map[string]any) (*PublishItemResult, error) {
+func (c *ClientImpl) publishItemOnce(ctx context.Context, cookiesStr string, req PublishItemRequest, images, specImages []uploadedImage, category map[string]any) (*PublishItemResult, error) {
 	// imagePayloads 用于本次流程后续判断的图片Payloads
 	imagePayloads := make([]any, 0, len(images))
 	// i、img 表示当前遍历过程中的i、img
@@ -512,6 +578,15 @@ func (c *ClientImpl) publishItemOnce(ctx context.Context, cookiesStr string, req
 		"bizcode":      "pcMainPublish",
 		"publishScene": "pcMainPublish",
 	}
+	if len(req.Specs) > 0 {
+		data["itemProperties"] = publishPropertiesPayload(req.Specs, specImages)
+		data["itemSkuList"] = publishSKUListPayload(req.SKUs)
+		// propertyImages 保存规格值图片的官方引用列表。
+		propertyImages := publishPropertyImageList(req.Specs, specImages)
+		if len(propertyImages) > 0 {
+			data["propertyImageList"] = propertyImages
+		}
+	}
 	if req.Location != nil {
 		if !validPublishLocation(*req.Location) {
 			return nil, errors.New("发货地信息不完整，请重新定位并选择")
@@ -528,12 +603,28 @@ func (c *ClientImpl) publishItemOnce(ctx context.Context, cookiesStr string, req
 	// decoded、updated、err 用于本次流程后续判断的decoded、updated、err
 	decoded, updated, err := c.callMTop(ctx, cookiesStr, PublishItemAPI, "mtop.idle.pc.idleitem.publish", "1.0", "a21ybx.publish.0.0", "a21ybx.home.sidebar.1.46413da6EPl7v5", "46413da6EPl7v5", data)
 	if err != nil {
+		if isPublishTokenFailure(err) {
+			return nil, &PublishError{Code: PublishErrorTokenExpired, Body: err.Error()}
+		}
 		return nil, err
 	}
 	// ret 用于本次流程后续判断的ret
 	ret := retFromDecoded(decoded)
 	if !hasMTopSuccess(ret) {
-		return nil, classifyPublishError(ret, decoded)
+		// classifiedPublishErr 保存发布域能够从无错误码文本中识别出的既有专用错误，例如库存权限不足。
+		classifiedPublishErr := classifyPublishError(ret, decoded)
+		// publishErr 是发布域专用错误视图；已知专用码优先于通用未知系统分类。
+		var publishErr *PublishError
+		if errors.As(classifiedPublishErr, &publishErr) && publishErr.Code != PublishErrorUnknown {
+			return nil, classifiedPublishErr
+		}
+		// failure 保存最终发布接口的统一平台失败分类；库存/权限错误仍保留既有专用码。
+		failure := c.mtopResponseFailure("mtop.idle.pc.idleitem.publish", http.StatusOK, ret, "平台 ret 未包含 SUCCESS")
+		// kind、ok 保存最终发布接口失败分类及其是否存在。
+		if kind, ok := MTopErrorKindOf(failure); ok && kind != MTopErrorBusiness {
+			return nil, failure
+		}
+		return nil, classifiedPublishErr
 	}
 	// dataMap 用于本次流程后续判断的数据Map
 	dataMap := mapFromAny(decoded["data"])
@@ -546,7 +637,7 @@ func (c *ClientImpl) publishItemOnce(ctx context.Context, cookiesStr string, req
 	result := &PublishItemResult{
 		ItemID:         itemID,
 		Title:          req.Title,
-		PriceText:      centsText(req.PriceCents),
+		PriceText:      publishRepresentativePriceText(req),
 		CategoryID:     mtopString(cat["catId"]),
 		CategoryName:   mtopString(cat["catName"]),
 		ImageURL:       images[0].URL,
@@ -558,52 +649,6 @@ func (c *ClientImpl) publishItemOnce(ctx context.Context, cookiesStr string, req
 		result.ItemURL = "https://www.goofish.com/item?id=" + itemID
 	}
 	return result, nil
-}
-
-// callMTop 封装callMTop业务协调。
-func (c *ClientImpl) callMTop(ctx context.Context, cookiesStr, endpoint, api, version, spmCnt, spmPre, logID string, data any) (map[string]any, string, error) {
-	// hc 用于本次流程后续判断的hc
-	hc := c.httpClient()
-	// rawData 用于本次流程后续判断的原始数据
-	rawData, _ := json.Marshal(data)
-	// dataVal 用于本次流程后续判断的数据Val
-	dataVal := string(rawData)
-	// signingCookies、requestCookies 用于本次流程后续判断的signingCookies、requestCookies
-	signingCookies, requestCookies := mtopRequestCookies(ctx, cookiesStr, "https://www.goofish.com/", endpoint)
-	// t 用于本次流程后续判断的t
-	t := strconv.FormatInt(time.Now().UnixMilli(), 10)
-	// sign 用于本次流程后续判断的sign
-	sign := protocol.GenerateSign(t, protocol.SignToken(signingCookies), dataVal)
-	// query 用于本次流程后续判断的查询
-	query := buildMTopQuery(api, version, t, sign, spmCnt, spmPre, logID)
-	// body 用于本次流程后续判断的请求体
-	body := "data=" + url.QueryEscape(dataVal)
-	// req、err 用于本次流程后续判断的req、err
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+"?"+query, strings.NewReader(body))
-	if err != nil {
-		return nil, cookiesStr, err
-	}
-	setCommonHeaders(req, requestCookies)
-	// resp、err 用于本次流程后续判断的resp、err
-	resp, err := hc.Do(req)
-	if err != nil {
-		return nil, cookiesStr, fmt.Errorf("%s 请求失败: %w", api, err)
-	}
-	defer resp.Body.Close()
-	// updated 用于本次流程后续判断的updated
-	updated := absorbMTopResponseCookies(ctx, cookiesStr, resp)
-	// raw、err 用于本次流程后续判断的raw、err
-	raw, err := readMTopBody(resp)
-	if err != nil {
-		return nil, updated, err
-	}
-	// decoded 用于本次流程后续判断的decoded
-	var decoded map[string]any
-	if // err 用于本次流程后续判断的err
-	err := json.Unmarshal(raw, &decoded); err != nil {
-		return nil, updated, fmt.Errorf("解析 %s 响应失败: %w (body=%s)", api, err, truncate(string(raw), 300))
-	}
-	return decoded, updated, nil
 }
 
 // buildMTopQuery 封装buildMTop查询业务协调。
@@ -648,30 +693,6 @@ func setBrowserHeaders(req *http.Request, cookiesStr string) {
 	req.Header.Set("origin", "https://www.goofish.com")
 	req.Header.Set("referer", "https://www.goofish.com/")
 	req.Header.Set("cookie", cookiesStr)
-}
-
-// publishImagePayload 封装发布图片请求载荷业务协调。
-func publishImagePayload(img uploadedImage, major bool) map[string]any {
-	return map[string]any{
-		"extraInfo":  map[string]any{"isH": "false", "isT": "false", "raw": "false"},
-		"isQrCode":   false,
-		"url":        img.URL,
-		"heightSize": img.Height,
-		"widthSize":  img.Width,
-		"major":      major,
-		"type":       0,
-		"status":     "done",
-	}
-}
-
-// publishPriceDTO 封装发布PriceDTO业务协调。
-func publishPriceDTO(req PublishItemRequest) map[string]any {
-	// out 用于本次流程后续判断的out
-	out := map[string]any{"priceInCent": strconv.FormatInt(req.PriceCents, 10)}
-	if req.OriginalPriceCents > 0 {
-		out["origPriceInCent"] = strconv.FormatInt(req.OriginalPriceCents, 10)
-	}
-	return out
 }
 
 // postageDTO 封装postageDTO业务协调。

@@ -1,10 +1,13 @@
 package mtop
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,11 +16,102 @@ import (
 	"time"
 )
 
+// TestMTopResponseFailureClassifiesAndRedacts 验证统一错误分类覆盖各类 MTOP 失败，并且日志与用户错误均不泄露凭证。
+func TestMTopResponseFailureClassifiesAndRedacts(t *testing.T) {
+	// logs 收集结构化日志，验证平台错误码和分类可供排障检索。
+	var logs bytes.Buffer
+	// client 使用测试日志器，避免把合成失败写入全局日志。
+	client := &ClientImpl{Logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+	// cases 覆盖风控、会话、Token、HTTP、解析和普通业务失败分类。
+	cases := []struct {
+		name   string
+		kind   MTopErrorKind
+		code   string
+		status int
+		detail string
+	}{
+		{name: "risk", kind: MTopErrorRiskVerification, code: "FAIL_SYS_USER_VALIDATE::安全校验", status: http.StatusOK},
+		{name: "session", kind: MTopErrorSessionExpired, code: "FAIL_SYS_SESSION_EXPIRED::会话过期", status: http.StatusOK},
+		{name: "token", kind: MTopErrorTokenExpired, code: "FAIL_SYS_TOKEN_EXPIRED::令牌过期", status: http.StatusOK},
+		{name: "system", kind: MTopErrorSystem, code: "FAIL_SYS_INTERNAL_ERROR::内部错误", status: http.StatusOK},
+		{name: "http", kind: MTopErrorHTTP, code: "FAIL_SYS_GATEWAY::网关错误", status: http.StatusBadGateway},
+		{name: "decode", kind: MTopErrorDecode, status: http.StatusOK, detail: "JSON 解析失败"},
+		{name: "business", kind: MTopErrorBusiness, code: "FAIL_BIZ_ORDER::订单错误", status: http.StatusOK},
+	}
+	// testCase 验证当前失败类型的错误链、诊断内容和日志字段。
+	for _, testCase := range cases {
+		// ret 只模拟平台错误标记，不包含真实账号信息。
+		ret := []string(nil)
+		if testCase.code != "" {
+			ret = []string{testCase.code + " cookie=_m_h5_tk=secret access_token=secret"}
+		}
+		// err 保存统一失败分类结果。
+		err := client.mtopResponseFailure("订单列表接口", testCase.status, ret, testCase.detail+" private-marker")
+		// kind、ok 保存错误链中解析出的失败分类。
+		kind, ok := MTopErrorKindOf(err)
+		if !ok || kind != testCase.kind {
+			t.Fatalf("%s kind=%q ok=%v want %q", testCase.name, kind, ok, testCase.kind)
+		}
+		if strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "private-marker") {
+			t.Fatalf("%s error leaked sensitive text: %s", testCase.name, err)
+		}
+	}
+	// output 保存结构化日志文本，验证日志包含可检索类别但不包含敏感值。
+	output := logs.String()
+	if !strings.Contains(output, `"category":"token_expired"`) || !strings.Contains(output, "FAIL_SYS_TOKEN_EXPIRED") {
+		t.Fatalf("structured MTOP failure log incomplete: %s", output)
+	}
+	if strings.Contains(output, "secret") || strings.Contains(output, "private-marker") {
+		t.Fatalf("structured MTOP failure log leaked sensitive text: %s", output)
+	}
+}
+
+// TestMTopResponseFailureWithCausePreservesErrorChain 验证统一 MTOP 错误保留底层取消原因但不泄露原因文本。
+func TestMTopResponseFailureWithCausePreservesErrorChain(t *testing.T) {
+	// cause 保存模拟 HTTP 响应读取阶段的取消错误及敏感诊断文本。
+	cause := fmt.Errorf("响应读取被取消，cookie=_m_h5_tk=secret")
+	// client 使用默认安全日志器完成错误构造。
+	client := &ClientImpl{}
+	// err 保存带底层原因的统一 MTOP 错误。
+	err := client.mtopResponseFailureWithCause("订单列表接口", http.StatusOK, nil, "读取响应失败", cause)
+	if !errors.Is(err, cause) {
+		t.Fatalf("底层错误未保留: %v", err)
+	}
+	if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("错误文本泄露底层敏感原因: %v", err)
+	}
+}
+
 // TestNewClientUsesGoHTTPByDefault 封装TestNewClientUsesGoHTTPByDefault业务协调。
 func TestNewClientUsesGoHTTPByDefault(t *testing.T) {
 	if // client 用于本次流程后续判断的client
 	client := NewClient(); client == nil {
 		t.Fatal("默认 MTOP 客户端为空")
+	}
+}
+
+// TestMTopTokenCookieChangedIgnoresUnrelatedCookieChanges 验证签名令牌判断只关注非空 _m_h5_tk 轮换。
+func TestMTopTokenCookieChangedIgnoresUnrelatedCookieChanges(t *testing.T) {
+	// cases 覆盖普通 Cookie 变化、签名令牌轮换、令牌缺失和相同值重复写回。
+	cases := []struct {
+		name     string
+		previous string
+		current  string
+		changed  bool
+	}{
+		{name: "unrelated", previous: "_m_h5_tk=token-a; sdkSilent=1", current: "_m_h5_tk=token-a; sdkSilent=2", changed: false},
+		{name: "expiry-only", previous: "_m_h5_tk=token-a_100", current: "_m_h5_tk=token-a_200", changed: false},
+		{name: "rotated", previous: "_m_h5_tk=token-a", current: "_m_h5_tk=token-b", changed: true},
+		{name: "missing", previous: "_m_h5_tk=token-a", current: "sdkSilent=2", changed: false},
+		{name: "same", previous: "_m_h5_tk=token-a", current: "_m_h5_tk=token-a", changed: false},
+	}
+	// testCase 逐项承载签名令牌变化样例，避免把普通 Cookie 更新误判为恢复。
+	for _, testCase := range cases {
+		// changed 保存当前样例是否应被识别为有效签名轮换。
+		changed := MTopTokenCookieChanged(testCase.previous, testCase.current)
+		if changed != testCase.changed {
+			t.Errorf("%s changed=%v want %v", testCase.name, changed, testCase.changed)
+		}
 	}
 }
 
@@ -85,8 +179,8 @@ func TestRefreshTokenUsesOfficialAttemptLimitWithoutUpdatedCookie(t *testing.T) 
 	client := &ClientImpl{HTTPClient: server.Client(), TokenURL: server.URL + "/"}
 	// err 用于本次流程后续判断的err
 	_, err := client.RefreshTokenContext(context.Background(), "unb=123; _m_h5_tk=oldtoken_1;")
-	if err == nil || !strings.Contains(err.Error(), "登录凭证已失效") {
-		t.Fatalf("err=%v", err)
+	if !IsMTopTokenExpiredErr(err) || IsSessionExpiredErr(err) || !strings.Contains(err.Error(), "重试次数已耗尽") {
+		t.Fatalf("Token 刷新耗尽必须保留 Token 分类: %v", err)
 	}
 	if requests.Load() != officialMTopMaxAttempts {
 		t.Fatalf("请求次数=%d want %d", requests.Load(), officialMTopMaxAttempts)
@@ -149,7 +243,7 @@ func TestConsignDoesNotRetryNonTokenFailure(t *testing.T) {
 	client := &ClientImpl{HTTPClient: server.Client(), ConsignURL: server.URL + "/"}
 	// ok、ret、err 用于本次流程后续判断的ok、ret、err
 	ok, ret, _, err := client.ConsignContext(context.Background(), "unb=123; _m_h5_tk=token_1;", "order-1")
-	if err != nil || ok || len(ret) == 0 {
+	if err != nil || ok || len(ret) == 0 || !strings.Contains(ret[0], "订单状态错误") {
 		t.Fatalf("ok=%v ret=%v err=%v", ok, ret, err)
 	}
 	if requests.Load() != 1 {
@@ -210,6 +304,9 @@ func TestIsTokenExpiredRet(t *testing.T) {
 		{[]string{"FAIL_SYS_TOKEN_EXOIRED::令牌过期"}, true},
 		{[]string{"FAIL_SYS_TOKEN_EXPIRED::令牌过期"}, true},
 		{[]string{"FAIL_SYS_SESSION_EXPIRED::会话过期"}, false},
+		{[]string{"SID_INVALID::会话无效"}, false},
+		{[]string{"AUTH_REJECT::认证拒绝"}, false},
+		{[]string{"NEED_LOGIN::需要登录"}, false},
 		{[]string{"FAIL_SYS_USER_VALIDATE::非法请求TOKEN"}, false},
 		{[]string{"SUCCESS::调用成功"}, false},
 		{[]string{"FAIL_BIZ_ORDER_STATUS_ERROR::订单状态错误"}, false},
@@ -242,6 +339,35 @@ func TestSessionExpiredRetIsSeparateFromTokenExpiry(t *testing.T) {
 	}
 }
 
+// TestOfficialSessionExpiredRetCodes 验证官网 lib-mtop 统一识别的四类 Session 失效码。
+func TestOfficialSessionExpiredRetCodes(t *testing.T) {
+	// cases 保存官网中会被归入 SESSION_EXPIRED 的平台返回码。
+	cases := []string{
+		"SESSION_EXPIRED",
+		"SID_INVALID",
+		"AUTH_REJECT",
+		"NEED_LOGIN",
+		"SESSION_EXPIRED::会话过期",
+		"SID_INVALID::会话无效",
+		"AUTH_REJECT::认证拒绝",
+		"NEED_LOGIN::需要登录",
+	}
+	// ret 表示当前待分类的平台返回码。
+	for _, ret := range cases {
+		if !IsSessionExpiredErr(errors.New(ret)) {
+			t.Errorf("非类型化官方 Session 错误未识别: %q", ret)
+		}
+		if !isSessionExpiredRet([]string{ret}) {
+			t.Errorf("官方 Session 失效码未识别: %q", ret)
+		}
+		// failure 保存统一错误分类，确认这些返回码不会误入 Token 过期路径。
+		failure := (&ClientImpl{}).mtopResponseFailure("test", http.StatusOK, []string{ret}, "平台返回失败")
+		if !IsSessionExpiredErr(failure) || IsMTopTokenExpiredErr(failure) {
+			t.Errorf("官方 Session 失效码分类错误: ret=%q err=%v", ret, failure)
+		}
+	}
+}
+
 // TestIsSessionExpiredErr 封装TestIs会话ExpiredErr业务协调。
 func TestIsSessionExpiredErr(t *testing.T) {
 	// cases 用于本次流程后续判断的cases
@@ -262,6 +388,20 @@ func TestIsSessionExpiredErr(t *testing.T) {
 		got := IsSessionExpiredErr(c.err); got != c.want {
 			t.Errorf("case %d: got %v want %v (err=%v)", i, got, c.want, c.err)
 		}
+	}
+}
+
+// TestIsCredentialRefreshableErr 验证仅明确 Session 失效允许账号级恢复；t 检查兼容分类入口。
+func TestIsCredentialRefreshableErr(t *testing.T) {
+	// tokenErr 是只应在 MTOP 内部刷新的签名 Token 失效错误。
+	tokenErr := &MTopResponseError{Kind: MTopErrorTokenExpired, API: "token", HTTPStatus: http.StatusOK}
+	// sessionErr 是需要协议续期或重新登录的 Session 失效错误。
+	sessionErr := &SessionExpiredError{API: "session", Ret: []string{"FAIL_SYS_SESSION_EXPIRED::Session过期"}}
+	if IsCredentialRefreshableErr(tokenErr) || !IsCredentialRefreshableErr(sessionErr) {
+		t.Fatal("仅 Session 失效可以进入账号级凭证恢复入口")
+	}
+	if IsCredentialRefreshableErr(errors.New("普通业务失败")) {
+		t.Fatal("普通业务失败不应触发凭证恢复")
 	}
 }
 

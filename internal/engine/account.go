@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"math/big"
 	"strings"
+	"sync"
 	"time"
 
 	"xianyu-go/internal/automation"
@@ -77,7 +78,7 @@ type Handler interface {
 	// HandleSystemEvent 处理平台系统事件。系统卡片永远不进入 AI 回复链，
 	// 这里只把事件交给自动化中心，由自动化规则决定是否执行。
 	HandleSystemEvent(ctx context.Context, task automation.Task) error
-	// OnPasswordLoginRefresh 是历史接口名；连续失败时只触发 Go 协议续期，
+	// OnPasswordLoginRefresh 是历史接口名；明确 Session 失效时触发 Go 协议续期，
 	// 不得启动浏览器密码登录。
 	OnPasswordLoginRefresh(ctx context.Context, cookieID string) bool
 	// OnAccountAlert 账号告警通知（token 失效/自动恢复失败/风控验证等）。
@@ -118,6 +119,12 @@ type transportReadyHandler interface {
 	OnTransportReady(ctx context.Context, cookieID string)
 }
 
+// initialTransportReadyHandler 接收单个账号运行实例首次 WebSocket 注册完成事件。
+// 它只用于启动后订单同步，不能替代每次重连均需执行的 transportReadyHandler。
+type initialTransportReadyHandler interface {
+	OnInitialTransportReady(ctx context.Context, cookieID string)
+}
+
 // tokenCaptchaHandler 用于本次流程后续判断的令牌CaptchaHandler
 type tokenCaptchaHandler interface {
 	OnTokenCaptchaVerification(ctx context.Context, cookieID, cookieStr, verificationURL, deviceID string) (*mtop.RefreshResult, bool)
@@ -149,19 +156,27 @@ type ChatMessage struct {
 	Text         string
 	MessageID    string
 	ItemID       string
-	Raw          map[string]any // 解密后的完整消息
+	// ObservedAt 是 WebSocket 分发器首次接纳消息的 Unix 毫秒时间，防抖期间保持不变，用于和本地会话删除排序。
+	ObservedAt int64
+	Raw        map[string]any // 解密后的完整消息
 }
 
-// OutgoingChatMessage is emitted after the existing account WebSocket has
-// accepted a text message. It is an observation hook only; persistence errors
-// never change the delivery result.
-// OutgoingChatMessage 用于本次流程后续判断的Outgoing聊天消息
+// OutgoingChatMessage 是账号 WebSocket 接受或回显的一条非敏感出站消息摘要。
+// 它同时供自动化回显确认和聊天历史旁路落库使用；持久化错误不能改写已经由发送层判定的外部结果。
 type OutgoingChatMessage struct {
-	AccountID  string
-	ChatID     string
-	BuyerID    string
-	Text       string
+	AccountID string
+	ChatID    string
+	BuyerID   string
+	Text      string
+	// RequestID 是发送请求使用的 mid；只有发送响应回调携带该值时才用于精确唤醒对应等待器。
+	RequestID  string
 	MessageKey string
+	// MessageType 是出站消息的展示类型；空值兼容历史文本观察。
+	MessageType string
+	// Content 是非文本消息的规范展示正文；文本观察可继续使用 Text。
+	Content string
+	// ObservedAt 是本进程确认平台消息或接纳跨端回显的 Unix 毫秒时间，用于和本地会话删除排序。
+	ObservedAt int64
 }
 
 // outgoingChatHandler 用于本次流程后续判断的outgoing聊天Handler
@@ -172,11 +187,28 @@ type outgoingChatHandler interface {
 // outgoingMessageKeyContextKey 用于本次流程后续判断的outgoing消息Key上下文Key
 type outgoingMessageKeyContextKey struct{}
 
+// outgoingEchoConfirmationContextKey 标记本次外发调用必须等待账号自身 WebSocket 回显。
+type outgoingEchoConfirmationContextKey struct{}
+
 // WithOutgoingMessageKey correlates a UI-created pending message with the
 // post-send observer so the same text is not inserted twice.
 // WithOutgoingMessageKey 封装WithOutgoing消息Key业务协调。
 func WithOutgoingMessageKey(ctx context.Context, key string) context.Context {
 	return context.WithValue(ctx, outgoingMessageKeyContextKey{}, strings.TrimSpace(key))
+}
+
+// WithOutgoingEchoConfirmation 标记自动化出站消息需要等待自身 WebSocket 回显。
+// ctx 是本次发送的取消边界；返回值只增加内部确认标记，不携带消息正文或凭证。
+func WithOutgoingEchoConfirmation(ctx context.Context) context.Context {
+	return context.WithValue(ctx, outgoingEchoConfirmationContextKey{}, true)
+}
+
+// wantsOutgoingEchoConfirmation 判断调用方是否要求把自身 WebSocket 回显作为发送确认条件。
+// ctx 是发送上下文；缺少标记时保持人工聊天的原有发送语义。
+func wantsOutgoingEchoConfirmation(ctx context.Context) bool {
+	// confirmed 表示调用方是否显式要求等待账号自身回显；缺省值保持人工发送兼容行为。
+	confirmed, _ := ctx.Value(outgoingEchoConfirmationContextKey{}).(bool)
+	return confirmed
 }
 
 // RuntimeStatus 是账号引擎的实时连接状态，不写入数据库。
@@ -214,6 +246,8 @@ type Account struct {
 	accountRuntimeComponents
 	// accountDependencies 固定该账号运行时使用的基础设施和业务端口。
 	accountDependencies
+	// initialTransportReadyOnce 确保每个运行实例只在首次消息传输就绪后启动一次订单同步；重连不重复触发，重启会创建新实例。
+	initialTransportReadyOnce sync.Once
 }
 
 // debounceEntry 用于本次流程后续判断的debounceEntry
@@ -268,6 +302,8 @@ type loginStatusCheckResult struct {
 	recovered       bool
 	riskRequired    bool
 	verificationURL string
+	// sessionExpired 只表示平台明确报告会话失效，网络或 Token 失败不能置真。
+	sessionExpired bool
 }
 
 // Config 构造 Account 所需依赖。
@@ -283,6 +319,8 @@ type Config struct {
 	Renewer cookieRenewer
 	// WSDialer 可选：用于测试隔离原生 WebSocket 握手。
 	WSDialer WSDialer
+	// ReplyDelivery 可选：生产自动回复使用的聊天应用完整发送端口；为空时不装配自动回复发送副作用。
+	ReplyDelivery ReplyDelivery
 }
 
 // New 构造单账号运行时（未启动）。
@@ -334,22 +372,29 @@ func New(cfg Config) *Account {
 		},
 		accountDependencies: newAccountDependencies(cfg.Store, mtopClient, renewer, wsDialer, cfg.Handler, logger.With("account", cfg.CookieID), nil, newWSRecorder(cfg.Store, cfg.CookieID, logger)),
 	}
+	// echoTracker 保存当前账号自动化出站消息的回显等待项；其生命周期与账号 facade 一致。
+	echoTracker := newOutgoingEchoTracker()
 	if cfg.Store != nil {
-		a.reply = NewReplyService(cfg.CookieID, cfg.Store, a, nil, NewAIReplier(cfg.CookieID, cfg.Store, logger), logger)
+		// aiReplier 保存当前账号的 AI 回复生成能力。
+		aiReplier := NewAIReplier(cfg.CookieID, cfg.Store, logger)
+		if cfg.ReplyDelivery != nil {
+			a.reply = NewReplyService(cfg.CookieID, cfg.Store, cfg.ReplyDelivery, nil, aiReplier, logger)
+		}
 	}
 	a.messageDispatcher = newMessageDispatcher(messageDispatcherConfig{
-		CookieID:       cfg.CookieID,
-		CurrentCookie:  a.currentCookieStr,
-		CurrentHandler: func() Handler { return a.handler },
-		Reply:          a.reply,
-		Logger:         logger,
-		BeginTask:      a.lifecycle.beginTask,
-		RecordMessage:  a.recordMessageReceived,
+		CookieID:        cfg.CookieID,
+		CurrentCookie:   a.currentCookieStr,
+		CurrentHandler:  func() Handler { return a.handler },
+		ObserveOutgoing: echoTracker.observeMessage,
+		Reply:           a.reply,
+		Logger:          logger,
+		BeginTask:       a.lifecycle.beginTask,
+		RecordMessage:   a.recordMessageReceived,
 	})
 	// connection 保存绑定当前账号 facade 的连接编排组件；它只在构造完成后才可被 Run 调用。
 	a.connection = connectionCoordinator{account: a}
 	// outgoing 保存绑定当前账号 facade 的出站消息协调器；它只读取连接快照后执行外部 I/O。
-	a.outgoing = outgoingMessageCoordinator{account: a}
+	a.outgoing = outgoingMessageCoordinator{account: a, echoTracker: echoTracker}
 	// credentials 保存绑定当前账号 facade 的凭证协调器；外部凭证 I/O 均由它控制锁边界。
 	a.credentials = credentialCoordinator{account: a}
 	return a
@@ -453,7 +498,7 @@ func (a *Account) beginTask() (context.Context, func(), bool) {
 	return a.lifecycle.beginTask()
 }
 
-// handleMaxFailures 是历史兼容恢复入口；只尝试 Go 协议续期，不执行密码登录。
+// handleMaxFailures 使用 ctx 处理 a 的历史连续失败入口；只有核验明确 Session 过期才续期，返回等待或恢复错误。
 func (a *Account) handleMaxFailures(ctx context.Context) error {
 	// 先执行低成本登录态检查。它可能仅凭 loginuser.get 响应头恢复签名
 	// Cookie，也能在进入静默续期前准确识别风控状态。
@@ -466,6 +511,10 @@ func (a *Account) handleMaxFailures(ctx context.Context) error {
 		a.logger.Info("登录态检查已恢复 Cookie，重置失败计数")
 		a.setRuntimeState(RuntimeConnecting, "登录凭证已刷新，正在重新连接")
 		a.resetFailures()
+		return sleepCtx(ctx, 2*time.Second)
+	}
+	if !loginStatus.sessionExpired {
+		a.setRuntimeState(RuntimeReconnecting, "连接失败，等待重试")
 		return sleepCtx(ctx, 2*time.Second)
 	}
 	a.logger.Warn("连续失败达上限，触发 Go 协议续期", "failures", MaxConnectionFailures)

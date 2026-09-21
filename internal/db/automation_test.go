@@ -116,7 +116,11 @@ func TestAutomationDeliveryProofIsEncryptedAndRestored(t *testing.T) {
 		t.Fatal(err)
 	}
 	// proof 保存不会写入延迟任务或日志的确认发货凭证。
-	proof := AutomationDeliveryProof{TradeText: "TEST-CARD-CONTENT", PicList: []string{"https://example.invalid/card.png"}}
+	proof := AutomationDeliveryProof{
+		TradeText: "TEST-CARD-CONTENT",
+		PicList:   []string{"https://example.invalid/card.png"},
+		Messages:  []AutomationDeliveryMessage{{Kind: "text", Content: "TEST-CARD-CONTENT"}, {Kind: "image", Content: "https://example.invalid/card.png"}},
+	}
 	// err 保存凭证和动作游标原子推进错误。
 	if err := store.Automation.AdvanceRunAction(ctx, AutomationRunActionAdvance{RunID: runID, Attempt: run.AttemptCount, Cursor: 0, SentDelta: 1, DeliveryProof: &proof}); err != nil {
 		t.Fatal(err)
@@ -132,7 +136,7 @@ func TestAutomationDeliveryProofIsEncryptedAndRestored(t *testing.T) {
 	}
 	// restored、err 保存重读后的凭证，模拟延迟任务或服务重启恢复。
 	restored, err := store.Automation.GetRun(ctx, runID)
-	if err != nil || restored.DeliveryProof.TradeText != proof.TradeText || len(restored.DeliveryProof.PicList) != 1 {
+	if err != nil || restored.DeliveryProof.TradeText != proof.TradeText || len(restored.DeliveryProof.PicList) != 1 || len(restored.DeliveryProof.Messages) != 2 || restored.DeliveryProof.Messages[0].Content != "TEST-CARD-CONTENT" {
 		t.Fatalf("restored proof mismatch: err=%v", err)
 	}
 }
@@ -281,10 +285,15 @@ func TestAutomation_UpdateDelete(t *testing.T) {
 	ctx := context.Background()
 	// uid、cid 用于本次流程后续判断的uid、cid
 	uid, cid := seedAccount(t, s)
+	// cardID、cardErr 保存规则动作引用的卡密组及创建错误，用于验证规则删除后引用被级联清理。
+	cardID, cardErr := s.Cards.Create(ctx, &CardFull{Name: "规则引用卡密", Type: "text", TextContent: "C", Enabled: true, UserID: uid})
+	if cardErr != nil {
+		t.Fatalf("Create card: %v", cardErr)
+	}
 
 	// ruleID、err 用于本次流程后续判断的规则ID、err
 	ruleID, err := s.Automation.Create(ctx, makeAutomationRule(cid, uid, "i1", "paid", true, 100,
-		AutomationActionInput{ActionType: "send_card", Enabled: true},
+		AutomationActionInput{ActionType: "send_card", CardID: cardID, Enabled: true},
 	))
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -296,7 +305,7 @@ func TestAutomation_UpdateDelete(t *testing.T) {
 		TriggerType: "shipped", Enabled: false, Priority: 50,
 		Actions: []AutomationActionInput{
 			{ActionType: "send_msg", MessageTemplate: "x", Enabled: true, SortOrder: 1},
-			{ActionType: "send_card", Enabled: true, SortOrder: 2},
+			{ActionType: "send_card", CardID: cardID, Enabled: true, SortOrder: 2},
 		},
 	}); err != nil {
 		t.Fatalf("Update: %v", err)
@@ -327,16 +336,33 @@ func TestAutomation_UpdateDelete(t *testing.T) {
 	if len(rules) != 0 {
 		t.Fatalf("Delete 后 len=%d want 0", len(rules))
 	}
-	// deletedAt 用于本次流程后续判断的deletedAt
-	var deletedAt string
-	// enabled 用于本次流程后续判断的启用状态
-	var enabled int
+	// ruleCount、actionCount 保存物理删除后规则及其动作的剩余数量。
+	var ruleCount, actionCount int
 	if // err 用于本次流程后续判断的err
-	err := s.DB.QueryRowContext(ctx, `SELECT deleted_at, enabled FROM automation_rules WHERE id=?`, ruleID).Scan(&deletedAt, &enabled); err != nil {
-		t.Fatalf("逻辑删除后规则原始行不存在: %v", err)
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM automation_rules WHERE id=?`, ruleID).Scan(&ruleCount); err != nil {
+		t.Fatalf("物理删除后查询规则失败: %v", err)
 	}
-	if deletedAt == "" || enabled != 0 {
-		t.Fatalf("规则未逻辑删除并禁用: deleted_at=%q enabled=%d", deletedAt, enabled)
+	// err 表示物理删除后查询规则动作数量的数据库错误。
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM automation_rule_actions WHERE rule_id=?`, ruleID).Scan(&actionCount); err != nil {
+		t.Fatalf("物理删除后查询规则动作失败: %v", err)
+	}
+	if ruleCount != 0 || actionCount != 0 {
+		t.Fatalf("规则或动作未物理删除: rule_count=%d action_count=%d", ruleCount, actionCount)
+	}
+	// err 表示规则删除后再次删除卡密组的数据库错误。
+	if err := s.Cards.Delete(ctx, cardID); err != nil {
+		t.Fatalf("规则物理删除后卡密仍无法删除: %v", err)
+	}
+	// legacyRuleID、legacyRuleErr 保存历史逻辑删除规则，用于验证新删除语义能够清理旧残留数据。
+	legacyRuleID, legacyRuleErr := s.Automation.Create(ctx, makeAutomationRule(cid, uid, "i4", "paid", true, 100))
+	if legacyRuleErr != nil {
+		t.Fatalf("Create legacy rule: %v", legacyRuleErr)
+	}
+	if _, legacyRuleErr = s.DB.ExecContext(ctx, `UPDATE automation_rules SET deleted_at=CURRENT_TIMESTAMP, enabled=0 WHERE id=?`, legacyRuleID); legacyRuleErr != nil {
+		t.Fatalf("mark legacy rule deleted: %v", legacyRuleErr)
+	}
+	if legacyRuleErr = s.Automation.Delete(ctx, uid, legacyRuleID); legacyRuleErr != nil {
+		t.Fatalf("delete legacy logical rule: %v", legacyRuleErr)
 	}
 	// 重复 Delete → ErrNotFound。
 	if err := s.Automation.Delete(ctx, uid, ruleID); !errors.Is(err, ErrNotFound) {
@@ -1027,7 +1053,7 @@ func TestAutomationQuarantinePreservesDeliveryProofUntilCancel(t *testing.T) {
 	}
 	// quarantined、readErr 保存隔离后的运行和凭证，确认人工处理期间凭证仍可恢复。
 	quarantined, readErr := store.Automation.GetRun(ctx, runID)
-	if readErr != nil || quarantined.Status != "needs_review" || quarantined.DeliveryProof.TradeText != proof.TradeText || len(quarantined.DeliveryProof.PicList) != 1 {
+	if readErr != nil || quarantined.Status != "needs_review" || !quarantined.ActionStarted || quarantined.DeliveryProof.TradeText != proof.TradeText || len(quarantined.DeliveryProof.PicList) != 1 {
 		t.Fatalf("隔离后凭证异常: run=%+v err=%v", quarantined, readErr)
 	}
 	// cancelResolutionErr 保存确认发货未知运行的取消处理错误。
@@ -1106,6 +1132,28 @@ func TestAutomationIssuePolicyForDisabledRuleRequiresReenableBeforeRetry(t *test
 	kind, allowed = automationIssuePolicy(raw, false, 0, true, 0, "自动化规则不存在或已停用，无法恢复")
 	if kind != "rule_unavailable" || !containsString(allowed, "retry") || containsString(allowed, "continue") {
 		t.Fatalf("reenabled policy kind=%q allowed=%v", kind, allowed)
+	}
+}
+
+// TestAutomationIssuePolicyRejectsHistoricalPartialRetry 验证历史记录丢失动作占用标志但已有发送数量时只能人工取消。
+func TestAutomationIssuePolicyRejectsHistoricalPartialRetry(t *testing.T) {
+	// raw 是包含有效账号和动作计划的历史任务快照。
+	raw := `{"AccountID":"acc1","ActionPlan":[{"ActionType":"send_card"},{"ActionType":"confirm_shipment"}]}`
+	// kind、allowed 保存历史部分发送记录的恢复策略。
+	kind, allowed := automationIssuePolicy(raw, false, 0, true, 1, "历史版本补发失败")
+	if kind != "partial_failure" || len(allowed) != 1 || allowed[0] != "cancel" {
+		t.Fatalf("历史部分发送不应开放重试: kind=%q allowed=%v", kind, allowed)
+	}
+}
+
+// TestAutomationIssuePolicyRejectsManualReplayContinue 验证人工补发失败后不能用 continue 跳过确认发货动作。
+func TestAutomationIssuePolicyRejectsManualReplayContinue(t *testing.T) {
+	// raw 是包含卡密发送和确认发货动作的人工补发历史计划。
+	raw := `{"AccountID":"acc1","ActionPlan":[{"ActionType":"send_card"},{"ActionType":"confirm_shipment"}]}`
+	// kind、allowed 保存人工补发未知结果的恢复策略。
+	kind, allowed := automationIssuePolicy(raw, true, 1, true, 1, "人工补发失败，外部结果可能未知: 确认发货失败")
+	if kind != "external_result_unknown" || len(allowed) != 1 || allowed[0] != "cancel" {
+		t.Fatalf("人工补发失败不应开放 continue: kind=%q allowed=%v", kind, allowed)
 	}
 }
 
@@ -1267,6 +1315,19 @@ func TestAutomationRuleDeleteRejectsActiveRun(t *testing.T) {
 	if // err 用于本次流程后续判断的err
 	err := s.Automation.Delete(ctx, uid, ruleID); !errors.Is(err, ErrAutomationRunActive) {
 		t.Fatalf("delete err=%v", err)
+	}
+	// ruleCount、actionCount 保存被保护规则及其动作的数量，确认运行中规则不会被物理删除。
+	var ruleCount, actionCount int
+	if // err 表示查询受保护规则数量的数据库错误。
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM automation_rules WHERE id=?`, ruleID).Scan(&ruleCount); err != nil {
+		t.Fatalf("query active rule: %v", err)
+	}
+	if // err 表示查询受保护规则动作数量的数据库错误。
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM automation_rule_actions WHERE rule_id=?`, ruleID).Scan(&actionCount); err != nil {
+		t.Fatalf("query active rule actions: %v", err)
+	}
+	if ruleCount != 1 || actionCount != 1 {
+		t.Fatalf("active rule was deleted: rule_count=%d action_count=%d", ruleCount, actionCount)
 	}
 }
 

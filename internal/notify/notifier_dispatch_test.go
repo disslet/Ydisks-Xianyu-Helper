@@ -467,6 +467,114 @@ func TestNotifyAutomationRunQueuesEachTerminalStateOnce(t *testing.T) {
 	}
 }
 
+// TestNotifyAutomationRunForTriggerFiltersByAutomationCategory 验证自动化四类结果使用独立事件筛选并分别入队。
+func TestNotifyAutomationRunForTriggerFiltersByAutomationCategory(t *testing.T) {
+	// store、cleanup 保存本测试的 SQLite 通知存储与关闭责任。
+	store, cleanup := newNotifyStoreBare(t)
+	defer cleanup()
+	// paidChannelID、reviewChannelID 保存分别订阅付款发货和评价赠品的渠道。
+	paidChannelID := addWebhookChannel(t, store, "cid", "付款渠道", "http://127.0.0.1:1")
+	// reviewChannelID 保存只订阅评价赠品的渠道主键，用于验证另一类自动化不会误入队。
+	reviewChannelID := addWebhookChannel(t, store, "cid", "评价渠道", "http://127.0.0.1:1")
+	// updateErr 保存为两个渠道写入独立自动化事件订阅时的数据库错误。
+	if _, updateErr := store.DB.ExecContext(context.Background(), `UPDATE notification_channels SET event_types=? WHERE id=?`, `["`+EventAutomationOrderPaid+`"]`, paidChannelID); updateErr != nil {
+		t.Fatal(updateErr)
+	}
+	// updateErr 保存评价赠品渠道订阅配置的数据库更新错误。
+	if _, updateErr := store.DB.ExecContext(context.Background(), `UPDATE notification_channels SET event_types=? WHERE id=?`, `["`+EventAutomationBuyerReviewed+`"]`, reviewChannelID); updateErr != nil {
+		t.Fatal(updateErr)
+	}
+	// notifier 保存未启动 worker 的真实通知器；带稳定幂等键的自动化结果必须写入 outbox。
+	notifier := New("cid", store, nil)
+	notifier.NotifyAutomationRunForTrigger(context.Background(), "order_paid", 91, "cid", "buyer", "item", "success", "付款发货成功", "chat")
+	// counts 保存两个订阅渠道实际入队的消息数。
+	var paidCount, reviewCount int
+	if // countErr 保存读取付款渠道 outbox 数量时的数据库错误。
+	countErr := store.DB.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM notification_outbox WHERE channel_id=?`, paidChannelID).Scan(&paidCount); countErr != nil {
+		t.Fatal(countErr)
+	}
+	if // countErr 保存读取评价渠道 outbox 数量时的数据库错误。
+	countErr := store.DB.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM notification_outbox WHERE channel_id=?`, reviewChannelID).Scan(&reviewCount); countErr != nil {
+		t.Fatal(countErr)
+	}
+	if paidCount != 1 || reviewCount != 0 {
+		t.Fatalf("automation category counts paid=%d review=%d", paidCount, reviewCount)
+	}
+	// eventType 保存 outbox 中实际持久化的细分类别，防止后续 worker 丢失筛选依据。
+	var eventType string
+	if // scanErr 保存读取付款渠道 outbox 事件类型时的数据库错误。
+	scanErr := store.DB.QueryRowContext(context.Background(), `SELECT event_type FROM notification_outbox WHERE channel_id=?`, paidChannelID).Scan(&eventType); scanErr != nil {
+		t.Fatal(scanErr)
+	}
+	if eventType != EventAutomationOrderPaid {
+		t.Fatalf("event type=%q want %q", eventType, EventAutomationOrderPaid)
+	}
+}
+
+// TestNeedsReviewUsesManualInterventionCategoryWithLegacyFallback 验证人工处理终态使用独立类别，同时仍投递给原付款发货订阅。
+func TestNeedsReviewUsesManualInterventionCategoryWithLegacyFallback(t *testing.T) {
+	// store、cleanup 保存本测试的 SQLite 通知存储与关闭责任。
+	store, cleanup := newNotifyStoreBare(t)
+	defer cleanup()
+	// paidChannelID、manualChannelID 保存原付款发货订阅和新增人工处理订阅的渠道主键。
+	paidChannelID := addWebhookChannel(t, store, "cid", "付款渠道", "http://127.0.0.1:1")
+	// manualChannelID 保存新增人工处理订阅的渠道主键。
+	manualChannelID := addWebhookChannel(t, store, "cid", "人工处理渠道", "http://127.0.0.1:1")
+	// paidUpdateErr 保存付款发货订阅配置的写入错误。
+	_, paidUpdateErr := store.DB.ExecContext(context.Background(), `UPDATE notification_channels SET event_types=? WHERE id=?`, `["`+EventAutomationOrderPaid+`"]`, paidChannelID)
+	if paidUpdateErr != nil {
+		t.Fatal(paidUpdateErr)
+	}
+	// manualUpdateErr 保存独立人工处理订阅配置的写入错误。
+	_, manualUpdateErr := store.DB.ExecContext(context.Background(), `UPDATE notification_channels SET event_types=? WHERE id=?`, `["`+EventManualInterventionRequired+`"]`, manualChannelID)
+	if manualUpdateErr != nil {
+		t.Fatal(manualUpdateErr)
+	}
+	// notifier 保存真实通知器；稳定运行终态键会让两条渠道消息进入 outbox。
+	notifier := New("cid", store, nil)
+	notifier.NotifyAutomationRunForTrigger(context.Background(), "order_paid", 92, "cid", "buyer", "item", "needs_review", "付款发货结果不确定", "chat")
+	// eventType 保存两条 outbox 的统一实际类别。
+	var eventType string
+	// count 保存同一运行人工处理终态实际入队的渠道消息数量。
+	var count int
+	// scanErr 保存人工处理类别和渠道消息数的聚合读取错误。
+	scanErr := store.DB.QueryRowContext(context.Background(), `SELECT MIN(event_type),COUNT(*) FROM notification_outbox WHERE idempotency_key='automation-run:92:needs_review'`).Scan(&eventType, &count)
+	if scanErr != nil {
+		t.Fatal(scanErr)
+	}
+	if eventType != EventManualInterventionRequired || count != 2 {
+		t.Fatalf("人工处理通知类别=%q 数量=%d", eventType, count)
+	}
+}
+
+// TestNotifyManualInterventionQueuesStageAlertOnce 验证无运行主键的免拼阶段异常按稳定业务键去重入队。
+func TestNotifyManualInterventionQueuesStageAlertOnce(t *testing.T) {
+	// store、cleanup 保存本测试的 SQLite 通知存储与关闭责任。
+	store, cleanup := newNotifyStoreBare(t)
+	defer cleanup()
+	// channelID 保存只订阅人工处理告警的通知渠道主键。
+	channelID := addWebhookChannel(t, store, "cid", "人工处理渠道", "http://127.0.0.1:1")
+	// updateErr 保存人工处理订阅配置的写入错误。
+	_, updateErr := store.DB.ExecContext(context.Background(), `UPDATE notification_channels SET event_types=? WHERE id=?`, `["`+EventManualInterventionRequired+`"]`, channelID)
+	if updateErr != nil {
+		t.Fatal(updateErr)
+	}
+	// notifier 保存真实通知器；重复阶段通知应由 outbox 幂等键折叠。
+	notifier := New("cid", store, nil)
+	// idempotencyKey 是同一免拼订单阶段共享的稳定通知键。
+	idempotencyKey := "manual-intervention:bargain-free-shipping:cid:order-1"
+	notifier.NotifyManualIntervention(context.Background(), "bargain_pending", "cid", "order-1", "item", "buyer", "二人小刀免拼", "平台结果不确定", "chat", idempotencyKey)
+	notifier.NotifyManualIntervention(context.Background(), "bargain_pending", "cid", "order-1", "item", "buyer", "二人小刀免拼", "平台结果不确定", "chat", idempotencyKey)
+	// count 保存同一业务键最终持久化的通知数量。
+	var count int
+	if /* countErr 保存免拼人工处理通知数量的读取错误。 */ countErr := store.DB.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM notification_outbox WHERE idempotency_key=? AND event_type=?`, idempotencyKey, EventManualInterventionRequired).Scan(&count); countErr != nil {
+		t.Fatal(countErr)
+	}
+	if count != 1 {
+		t.Fatalf("免拼人工处理通知数量=%d want 1", count)
+	}
+}
+
 // TestParseConfig_InvalidJSON 非法 JSON 走旧格式兼容分支。
 func TestParseConfig_InvalidJSON(t *testing.T) {
 	// m 用于本次流程后续判断的m

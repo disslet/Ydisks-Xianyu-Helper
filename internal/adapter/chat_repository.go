@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"xianyu-go/internal/account"
 	chatapp "xianyu-go/internal/application/chat"
 	"xianyu-go/internal/db"
 	"xianyu-go/internal/xianyu/mtop"
@@ -56,13 +57,30 @@ func (r chatRepository) ListSessions(ctx context.Context, userID int64, accountI
 	// row 表示当前待转换的数据库聊天会话。
 	for _, row := range rows {
 		sessions = append(sessions, chatapp.Session{
-			AccountID: row.CookieID, ChatID: row.ChatID, BuyerID: row.BuyerID,
-			BuyerName: row.BuyerName, BuyerAvatar: row.BuyerAvatar, ItemID: row.ItemID,
+			AccountID: row.CookieID, ChatID: row.ChatID, PeerUserID: row.BuyerID,
+			PeerName: row.BuyerName, PeerAvatar: row.BuyerAvatar, AccountRole: row.AccountRole,
+			BuyerUserID: row.BuyerUserID, SellerUserID: row.SellerUserID, RoleItemID: row.RoleItemID, RoleSource: row.RoleSource, ItemID: row.ItemID,
 			ItemTitle: row.ItemTitle, ItemImageURL: row.ItemImageURL, LastMessage: row.LastMessage, LastMessageAt: row.LastMessageAt,
 			UnreadCount: row.UnreadCount,
 		})
 	}
 	return sessions, nil
+}
+
+// FindSession 按用户归属精确读取一条可见会话并转换为应用模型。
+func (r chatRepository) FindSession(ctx context.Context, userID int64, accountID, chatID string) (chatapp.Session, error) {
+	// row 和 err 是底层按归属精确查询的会话记录及错误。
+	row, err := r.store.Chats.FindSession(ctx, userID, accountID, chatID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return chatapp.Session{}, chatapp.ErrChatSessionNotFound
+		}
+		return chatapp.Session{}, err
+	}
+	return chatapp.Session{AccountID: row.CookieID, ChatID: row.ChatID, PeerUserID: row.BuyerID, PeerName: row.BuyerName,
+		PeerAvatar: row.BuyerAvatar, AccountRole: row.AccountRole, BuyerUserID: row.BuyerUserID, SellerUserID: row.SellerUserID,
+		RoleItemID: row.RoleItemID, RoleSource: row.RoleSource, ItemID: row.ItemID, ItemTitle: row.ItemTitle, ItemImageURL: row.ItemImageURL,
+		LastMessage: row.LastMessage, LastMessageAt: row.LastMessageAt, UnreadCount: row.UnreadCount}, nil
 }
 
 // ListSessionPage 查询带用户归属条件的本地会话键集分页，并转换为应用层模型。
@@ -82,8 +100,9 @@ func (r chatRepository) ListSessionPage(ctx context.Context, userID int64, accou
 	// row 表示当前待转换的数据库聊天会话。
 	for _, row := range databasePage.Sessions {
 		sessions = append(sessions, chatapp.Session{
-			AccountID: row.CookieID, ChatID: row.ChatID, BuyerID: row.BuyerID,
-			BuyerName: row.BuyerName, BuyerAvatar: row.BuyerAvatar, ItemID: row.ItemID,
+			AccountID: row.CookieID, ChatID: row.ChatID, PeerUserID: row.BuyerID,
+			PeerName: row.BuyerName, PeerAvatar: row.BuyerAvatar, AccountRole: row.AccountRole,
+			BuyerUserID: row.BuyerUserID, SellerUserID: row.SellerUserID, RoleItemID: row.RoleItemID, RoleSource: row.RoleSource, ItemID: row.ItemID,
 			ItemTitle: row.ItemTitle, ItemImageURL: row.ItemImageURL, LastMessage: row.LastMessage, LastMessageAt: row.LastMessageAt,
 			UnreadCount: row.UnreadCount,
 		})
@@ -101,9 +120,9 @@ func (r chatRepository) DeleteEmptySessions(ctx context.Context, accountID strin
 	return r.store.Chats.DeleteEmptySessions(ctx, accountID)
 }
 
-// UpdateSessionIdentity 更新会话的买家身份缓存。
-func (r chatRepository) UpdateSessionIdentity(ctx context.Context, accountID, chatID, buyerID, buyerName, buyerAvatar string) error {
-	return r.store.Chats.UpdateSessionIdentity(ctx, accountID, chatID, buyerID, buyerName, buyerAvatar)
+// UpdateSessionIdentity 更新会话对端的展示身份缓存；底层历史列名不进入应用契约。
+func (r chatRepository) UpdateSessionIdentity(ctx context.Context, accountID, chatID, peerUserID, peerName, peerAvatar string) error {
+	return r.store.Chats.UpdateSessionIdentity(ctx, accountID, chatID, peerUserID, peerName, peerAvatar)
 }
 
 // ExistsOwned 判断账号是否归属于指定用户，只返回非敏感存在性。
@@ -114,6 +133,11 @@ func (r chatRepository) ExistsOwned(ctx context.Context, userID int64, accountID
 // MarkRead 将用户拥有的聊天会话未读数归零，不读取或解密账号凭证。
 func (r chatRepository) MarkRead(ctx context.Context, userID int64, accountID, chatID string) error {
 	return r.store.Chats.MarkRead(ctx, userID, accountID, chatID)
+}
+
+// HideAndClearSession 原子隐藏当前用户的会话并清空聊天页消息，保留自动化仍需使用的会话实体。
+func (r chatRepository) HideAndClearSession(ctx context.Context, userID int64, accountID, chatID string, clearedAt int64) (bool, error) {
+	return r.store.Chats.HideAndClearSession(ctx, userID, accountID, chatID, clearedAt)
 }
 
 // FindInboundParsedJSONContaining 提供旧版聊天消息标识迁移所需的受限诊断帧查询。
@@ -184,24 +208,41 @@ type chatIdentityResolver struct {
 	store *db.Store
 	// clientProvider 返回当前可注入的 MTOP 客户端，便于运行时替换和测试。
 	clientProvider func() mtop.Client
+	// credentials 在适配器内完成响应 Cookie 的版本复核和持久化，不向应用层泄露凭证。
+	credentials chatCredentialRepository
+	// manager 用于把已经持久化的新 Cookie 同步到当前在线账号实例；为空时仅更新数据库。
+	manager *account.Manager
 }
 
 // NewChatIdentityResolver 创建聊天身份查询适配器。
-func NewChatIdentityResolver(store *db.Store, clientProvider func() mtop.Client) chatapp.IdentityResolver {
+func NewChatIdentityResolver(store *db.Store, clientProvider func() mtop.Client, manager *account.Manager) chatapp.IdentityResolver {
 	if store == nil || store.Cookies == nil || clientProvider == nil {
 		return nil
 	}
-	return chatIdentityResolver{store: store, clientProvider: clientProvider}
+	return chatIdentityResolver{store: store, clientProvider: clientProvider, credentials: chatCredentialRepository{store: store}, manager: manager}
 }
 
-// Resolve 查询聊天买家展示身份；Cookie 和平台客户端均不会离开适配器。
+// Resolve 查询聊天对端展示身份；Cookie 和平台客户端均不会离开适配器。
 func (r chatIdentityResolver) Resolve(ctx context.Context, accountID, chatID string) (chatapp.Identity, error) {
-	// cookies 和 err 保存平台调用需要的短暂凭证及读取错误，不得写入日志或响应。
-	cookies, err := r.store.Cookies.GetValue(ctx, accountID)
-	if err != nil {
-		return chatapp.Identity{}, err
+	if r.store == nil || r.store.Cookies == nil {
+		return chatapp.Identity{}, chatapp.ErrUnavailable
 	}
-	// client 保存当前 MTOP 客户端。
+	// credentialUnlock 保护本次请求的权威凭证快照读取；平台 I/O 开始前必须释放。
+	credentialUnlock := r.store.LockAccountCredentials(accountID)
+	// initial 和 credentialErr 保存本次身份查询使用的 Cookie 与 metadata 快照；不得进入日志或应用层返回值。
+	initial, credentialErr := r.store.Cookies.GetCookiePlatformRuntimeData(ctx, accountID)
+	if credentialErr != nil {
+		credentialUnlock()
+		return chatapp.Identity{}, credentialErr
+	}
+	if !hasStoredCredential(initial) {
+		credentialUnlock()
+		return chatapp.Identity{}, errors.New("账号凭证不可用")
+	}
+	// requestContext 和 cookieSession 吸收本次身份查询的全部响应 Cookie，包含 Token 过期响应中的换签 Cookie。
+	requestContext, cookieSession := withCookieSnapshot(ctx, initial)
+	credentialUnlock()
+	// client 保存当前注入的 MTOP 客户端。
 	client := r.clientProvider()
 	// fetcher 和 supported 保存身份查询能力及接口支持情况。
 	fetcher, supported := client.(interface {
@@ -210,19 +251,60 @@ func (r chatIdentityResolver) Resolve(ctx context.Context, accountID, chatID str
 	if !supported {
 		return chatapp.Identity{}, errors.New("当前 MTOP 客户端不支持聊天身份查询")
 	}
-	// info 和 err 保存平台返回的非敏感身份及查询错误。
-	info, err := fetcher.FetchChatUserInfo(ctx, cookies, chatID)
-	if err != nil {
-		return chatapp.Identity{}, err
+	// info 和 fetchErr 保存平台返回的展示身份与调用错误；即使 fetchErr 非空也必须先收口已收到的响应 Cookie。
+	info, fetchErr := fetcher.FetchChatUserInfo(requestContext, initial.Value, chatID)
+	// updatedCookies 兼容没有 CookieSession 的历史 MTOP 实现；当前实现优先从 cookieSession 读取完整 Cookie Jar。
+	updatedCookies := ""
+	if info != nil {
+		updatedCookies = info.UpdatedCookies
+	}
+	// runtimeCookie、syncRuntime 和 persistErr 保存凭证版本复核后的写回结果；旧请求不得覆盖并发更新的新凭证。
+	runtimeCookie, syncRuntime, persistErr := r.credentials.persistCookieSession(ctx, initial, cookieSession, updatedCookies)
+	if errors.Is(persistErr, errChatCredentialChanged) {
+		// 身份展示结果不依赖旧 Cookie；并发请求已经写入较新凭证时丢弃本次旧响应即可。
+		persistErr = nil
+	}
+	if persistErr != nil {
+		if fetchErr != nil {
+			return chatapp.Identity{}, errors.Join(fetchErr, persistErr)
+		}
+		return chatapp.Identity{}, persistErr
+	}
+	if syncRuntime {
+		r.updateRuntimeCookie(ctx, accountID, runtimeCookie)
+	}
+	if fetchErr != nil {
+		return chatapp.Identity{}, fetchErr
 	}
 	if info == nil {
 		return chatapp.Identity{}, nil
 	}
-	return chatapp.Identity{BuyerName: info.Nickname, BuyerAvatar: info.AvatarURL}, nil
+	return chatapp.Identity{PeerName: info.Nickname, PeerAvatar: info.AvatarURL}, nil
+}
+
+// updateRuntimeCookie 将已完成版本复核并写入数据库的身份查询 Cookie 同步到在线账号实例。
+func (r chatIdentityResolver) updateRuntimeCookie(ctx context.Context, accountID, value string) {
+	if r.manager == nil || value == "" {
+		return
+	}
+	// runtime 和 runtimeOK 保存当前账号实例及其存在性；账号未运行时数据库写回已经足够。
+	runtime, runtimeOK := r.manager.GetInstance(accountID)
+	if !runtimeOK || runtime == nil {
+		return
+	}
+	// contextualUpdater 和 supported 优先让同步操作继承 HTTP 请求的取消边界。
+	if contextualUpdater, supported := runtime.(contextualCookieUpdater); supported {
+		_ = contextualUpdater.UpdateCookieContext(ctx, value)
+		return
+	}
+	runtime.UpdateCookie(value)
 }
 
 // 确保数据库聊天适配器覆盖应用层会话端口的全部能力。
 var _ chatapp.SessionRepository = chatRepository{}
+
+// 确保数据库聊天适配器覆盖用户会话删除所需的归属与原子清空端口。
+var _ chatapp.SessionDeletionRepository = chatRepository{}
 
 // 确保数据库聊天适配器覆盖快捷回复和买家备注的应用层端口。
 var _ chatapp.MetadataRepository = chatRepository{}

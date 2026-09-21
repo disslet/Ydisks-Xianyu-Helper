@@ -122,7 +122,7 @@ describe('CardList 页面组合行为', /* 当前回调验证卡密筛选、批�
     fireEvent.click(screen.getAllByTitle('编辑')[0]);
     fireEvent.change(screen.getByDisplayValue('库存一'), { target: { value: '库存更新' } });
     fireEvent.click(screen.getByText('保存更改'));
-    await waitFor(/* editAssertion 等待卡密更新请求完成。 */ () => expect(cardListMocks.updateCard).toHaveBeenCalledWith(1, expect.objectContaining({ name: '库存更新', data_content: 'A\nB' })));
+    await waitFor(/* editAssertion 等待卡密更新请求完成。 */ () => expect(cardListMocks.updateCard).toHaveBeenCalledWith(1, expect.objectContaining({ name: '库存更新' })));
     expect(cardListMocks.loadCards).toHaveBeenCalledTimes(2);
   });
 
@@ -151,6 +151,23 @@ describe('CardList 页面组合行为', /* 当前回调验证卡密筛选、批�
     await waitFor(/* testResultAssertion 等待 API 测试结果展示。 */ () => expect(screen.getByText('HTTP 状态：200')).toBeTruthy());
     expect(screen.getByText('响应字段：data、message')).toBeTruthy();
     expect(screen.getByText('提取结果：TEST-CODE')).toBeTruthy();
+  });
+
+  test('API 测试外部失败且缺少响应字段时仍展示诊断', /* 当前回调验证旧服务端返回 null 字段时页面不崩溃。 */ async () => {
+    cardListMocks.testCardAPI.mockResolvedValue({
+      status: 'failed',
+      status_code: 404,
+      response_content_type: 'application/json; charset=utf-8',
+      response_fields: null,
+      response_preview: '{"error":{"message":"Invalid URL (GET /v1)"}}',
+    } as never);
+    render(<CardList />);
+    fireEvent.click(screen.getByText('添加新卡密'));
+    fireEvent.click(screen.getByRole('button', { name: 'API 接口' }));
+    fireEvent.click(screen.getByRole('button', { name: '测试请求' }));
+    await waitFor(/* failureResultAssertion 等待外部失败诊断完成渲染。 */ () => expect(screen.getByText('HTTP 状态：404')).toBeTruthy());
+    expect(screen.getByText('测试失败')).toBeTruthy();
+    expect(screen.getByText('响应字段：未识别 JSON 字段')).toBeTruthy();
   });
 
   test('启停、复制和删除按钮调用对应页面动作', /* 当前回调验证卡密行级动作边界。 */ async () => {

@@ -306,7 +306,7 @@ func (s *Scheduler) loginRenewOne(ctx context.Context, batchID string, account d
 		}
 		if credentialUpdated {
 			s.wakeCredentialBlockedAutomation(ctx, account.ID)
-			s.restartAfterCredentialUpdate(ctx, account.ID, account.Enabled, "登录态续期")
+			// Token Cookie 已持久化，后续 MTOP 请求读取新值；重启会额外触发启动 Session 续期。
 		}
 	}()
 	// started 用于本次流程后续判断的started
@@ -395,6 +395,11 @@ func (s *Scheduler) loginRenewOne(ctx context.Context, batchID string, account d
 		credentialUpdated = true
 	}
 	if callErr != nil {
+		// 仅刷新 Token 时收到的明确 Session 错误可以升级为账号续期。
+		sessionExpired = mtop.IsSessionExpiredErr(callErr)
+		if sessionExpired {
+			s.markSessionExpired(account.ID)
+		}
 		s.addLoginLog(ctx, batchID, account.ID, "failed", callErr.Error(), updated, time.Since(started))
 		s.logger.Warn("login_renew 失败", "account", account.ID, "err", callErr)
 		return
@@ -420,10 +425,8 @@ func (s *Scheduler) loginRenewOne(ctx context.Context, batchID string, account d
 		}
 	}
 	s.addLoginLog(ctx, batchID, account.ID, res.Status, res.Message, updated, time.Since(started))
-	if res.Status == mtop.LoginStatusSessionExpired || res.Status == mtop.LoginStatusTokenEmpty {
-		s.markSessionExpired(account.ID)
-	}
 	if res.Status == mtop.LoginStatusSessionExpired {
+		s.markSessionExpired(account.ID)
 		sessionExpired = true
 	}
 }
@@ -458,17 +461,14 @@ func (s *Scheduler) apiCookieRenewOne(ctx context.Context, batchID string, accou
 	credentialChanged := false
 	// credentialPersisted 用于本次流程后续判断的credentialPersisted
 	credentialPersisted := false
-	// restartHandled 用于本次流程后续判断的restartHandled
-	restartHandled := false
+	// renewalSucceeded 仅在官方 Promise 正常兑现后置真；部分 Cookie 更新不能触发恢复动作。
+	renewalSucceeded := false
 	defer func() {
 		if credentialLocked {
 			credentialUnlock()
 		}
-		if credentialPersisted {
+		if credentialPersisted && renewalSucceeded {
 			s.wakeCredentialBlockedAutomation(ctx, account.ID)
-			if !restartHandled {
-				s.restartAfterCredentialUpdate(ctx, account.ID, account.Enabled, "接口续期响应 Cookie")
-			}
 		}
 	}()
 	// started 用于本次流程后续判断的started
@@ -484,6 +484,8 @@ func (s *Scheduler) apiCookieRenewOne(ctx context.Context, batchID string, accou
 	if !account.Enabled {
 		return
 	}
+	// initialCookieValue、initialCookieMetadata 保存外部续期请求真正使用的凭证快照，供迟到响应冲突检查复用。
+	initialCookieValue, initialCookieMetadata := account.Value, account.MetadataJSON
 	// 续期请求只使用当前快照；慢速外部 API 调用不得持有共享凭证锁。
 	credentialUnlock()
 	credentialLocked = false
@@ -510,6 +512,9 @@ func (s *Scheduler) apiCookieRenewOne(ctx context.Context, batchID string, accou
 	// responseMetadataOverridden 表示续期响应已完成最新快照重放。
 	responseMetadataOverridden := false
 	account = latestAfterCall
+	if s.rejectConflictingAPIRenewal(ctx, batchID, account, initialCookieValue, initialCookieMetadata, res, credentialSnapshotChanged, started) {
+		return
+	}
 	if res != nil && credentialSnapshotChanged {
 		if len(res.SetCookies) > 0 {
 			// rebasedCookies、rebasedMetadata 保存基于最新账号快照重放响应 Cookie 的结果。
@@ -537,7 +542,7 @@ func (s *Scheduler) apiCookieRenewOne(ctx context.Context, batchID string, accou
 		return
 	}
 	if res.HasPending() {
-		s.watchPendingAPIRenew(ctx, batchID, account.ID, res)
+		s.watchPendingAPIRenew(ctx, batchID, account.ID, res, initialCookieValue, initialCookieMetadata)
 	}
 	// stepDetails 用于本次流程后续判断的stepDetails
 	stepDetails := make([]string, 0, len(res.StepDetails)+1)
@@ -576,13 +581,14 @@ func (s *Scheduler) apiCookieRenewOne(ctx context.Context, batchID string, accou
 		s.logger.Warn("接口续期任务失败，已保存响应头 Cookie", "account", account.ID, "method", res.RenewMethod, "updated", strings.Join(updated, ","), "err", callErr)
 		return
 	}
+	renewalSucceeded = res.Success
+	// 保持 v1.0.10 的重启边界：无凭证变化不重启，避免再次执行启动续期。
 	if res.Success && account.Enabled && credentialChanged {
 		s.logger.Info("接口续期任务成功", "account", account.ID, "method", res.RenewMethod, "updated", strings.Join(updated, ","), "message", res.Message)
 		credentialUnlock()
 		credentialLocked = false
 		if // restarter、ok 用于本次流程后续判断的restarter、ok
 		restarter, ok := s.starter.(accountRestarter); ok {
-			restartHandled = true
 			s.logger.Info("接口续期成功，正在重启账号以应用最新登录凭证", "account", account.ID)
 			if // err 用于本次流程后续判断的err
 			err := restarter.Restart(ctx, account.ID); err != nil {
@@ -625,6 +631,18 @@ func (s *Scheduler) apiCookieRenewOne(ctx context.Context, batchID string, accou
 	}
 }
 
+// rejectConflictingAPIRenewal 检测外部续期期间的并发凭证变化；冲突时只记录失败并拒绝旧响应写回。
+func (s *Scheduler) rejectConflictingAPIRenewal(ctx context.Context, batchID string, account db.RenewalRuntimeAccount, initialCookieValue, initialCookieMetadata string, result *apirenew.Result, snapshotChanged bool, started time.Time) bool {
+	if result == nil || !snapshotChanged || !apirenew.ResponseCookiesConflict(initialCookieValue, initialCookieMetadata, account.Value, account.MetadataJSON, result) {
+		return false
+	}
+	// message 表示不含凭证内容的并发冲突原因。
+	message := "并发凭证更新，已拒绝旧续期响应"
+	s.addAPILog(ctx, db.RenewalLog{BatchID: batchID, CookieID: account.ID, Status: "failed", ErrorMessage: message, RenewMethod: "auto_login_plugin", DurationMS: time.Since(started).Milliseconds(), RequestCount: result.RequestCount})
+	s.logger.Warn("接口续期并发凭证冲突，已拒绝旧响应", "account", account.ID)
+	return true
+}
+
 // restartAfterCredentialUpdate 封装restartAfterCredentialUpdate业务协调。
 func (s *Scheduler) restartAfterCredentialUpdate(ctx context.Context, accountID string, enabled bool, source string) {
 	if !enabled || ctx.Err() != nil {
@@ -651,7 +669,7 @@ func (s *Scheduler) renewAPI(ctx context.Context, cookieStr string, snapshot []c
 }
 
 // watchPendingAPIRenew 封装watchPendingAPIRenew业务协调。
-func (s *Scheduler) watchPendingAPIRenew(ctx context.Context, batchID, cookieID string, result *apirenew.Result) {
+func (s *Scheduler) watchPendingAPIRenew(ctx context.Context, batchID, cookieID string, result *apirenew.Result, initialCookieValue, initialCookieMetadata string) {
 	if result == nil || !result.HasPending() || s.store == nil || s.store.Cookies == nil {
 		return
 	}
@@ -689,6 +707,11 @@ func (s *Scheduler) watchPendingAPIRenew(ctx context.Context, batchID, cookieID 
 				finalErr = getErr
 				return false
 			}
+			if apirenew.ResponseCookiesConflict(initialCookieValue, initialCookieMetadata, detail.Value, detail.MetadataJSON, late) {
+				finalErr = errors.New("并发凭证更新，已拒绝迟到续期响应")
+				s.logger.Warn("保存定时静默续期迟到 Cookie 时检测到并发凭证冲突", "account", cookieID)
+				return false
+			}
 			// newCookies、metadata、changed 用于本次流程后续判断的newCookies、metadata、changed
 			newCookies, metadata, changed := apirenew.RebaseResponseCookies(detail.Value, detail.MetadataJSON, late)
 			if !changed {
@@ -707,27 +730,8 @@ func (s *Scheduler) watchPendingAPIRenew(ctx context.Context, batchID, cookieID 
 		}()
 		if changed {
 			s.logger.Info("已异步接收定时静默续期迟到 Cookie", "account", cookieID)
-			if // restarter、ok 用于本次流程后续判断的restarter、ok
-			restarter, ok := s.starter.(accountRestarter); ok {
-				// enabled、statusErr 用于本次流程后续判断的enabled、statusErr
-				enabled, _, statusErr := s.store.Cookies.StatusWithReason(opCtx, cookieID)
-				if statusErr != nil {
-					s.logger.Warn("迟到续期 Cookie 已保存，但读取账号状态失败", "account", cookieID, "err", statusErr)
-					finalErr = statusErr
-				} else if !enabled {
-					s.logger.Info("迟到续期 Cookie 已保存，账号已停用，不执行重启", "account", cookieID)
-				} else {
-					s.logger.Info("迟到续期 Cookie 已更新，正在重启账号以应用最新登录凭证", "account", cookieID)
-					if // restartErr 用于本次流程后续判断的restartErr
-					restartErr := restarter.Restart(opCtx, cookieID); restartErr != nil {
-						s.logger.Warn("迟到续期 Cookie 已保存，但重启账号失败", "account", cookieID, "err", restartErr)
-						finalErr = restartErr
-					} else {
-						s.logger.Info("迟到续期 Cookie 更新后的账号重启已完成", "account", cookieID)
-					}
-				}
-			}
-			s.wakeCredentialBlockedAutomation(opCtx, cookieID)
+			// Promise 已超时，Cookie Jar 更新不等于 reload；不得重启健康 WS
+			// 或据此宣布登录恢复。后续请求从持久化 Jar 获取最新凭证。
 		}
 		if waitErr != nil {
 			s.logger.Warn("定时静默续期底层响应失败，已保存响应 Cookie", "account", cookieID, "err", waitErr)

@@ -65,7 +65,7 @@ func (c *connectionCoordinator) run(parent context.Context) error {
 		// 官网先完成原生 WebSocket 握手，再从 authTokenCallback 获取本次
 		// 连接专用 token，最后发送 /reg。
 		// conn、err 保存当前 WebSocket 连接及拨号或后续认证阶段的错误。
-		conn, err := a.wsDialer.Dial(ctx, ws.Config{Recorder: a.wsRecorder()}, a.logger)
+		conn, err := a.wsDialer.Dial(ctx, ws.Config{Recorder: a.wsRecorder(), ObserveOutgoing: a.outgoing.observePlatformSendResponse}, a.logger)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -245,12 +245,14 @@ func (c *connectionCoordinator) markConnectionOnline(ctx context.Context, conn W
 	a.runtimeMu.Unlock()
 	a.setRuntimeState(RuntimeOnline, "消息服务连接正常")
 	a.notifyTransportReady(ctx)
+	a.notifyInitialTransportReady()
 	if shouldRecovered {
 		a.alertEvent(ctx, EventAccountRecovered, AlertLevelInfo, "账号已恢复在线", fmt.Sprintf("账号 %s 已重新连接闲鱼消息服务。掉线开始时间：%s。", a.CookieID, formatTimeOrUnknown(offlineSince)))
 	}
 }
 
-// handleTokenAcquisitionFailure 关闭本轮连接并按风控、Session 失效或可重试网络错误决定后续动作。
+// handleTokenAcquisitionFailure 关闭 conn 并处理 tokenErr；ctx 控制退避取消，返回是否重连及终止错误。
+// MTOP 客户端已执行 Token 内部刷新，耗尽后只退避；仅明确 Session 失效允许 c 的账号请求协议续期。
 func (c *connectionCoordinator) handleTokenAcquisitionFailure(ctx context.Context, conn WSConn, tokenErr error) (bool, error) {
 	// a 是协调器拥有的账号 facade；retry 为 true 时调用方必须重新执行一轮完整连接流程。
 	a := c.account

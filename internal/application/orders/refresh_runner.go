@@ -53,19 +53,23 @@ type RefreshJobResult struct {
 
 // RefreshJobSummary 是订单刷新任务结果中的统计摘要。
 type RefreshJobSummary struct {
+	// Restored 是同账号软删除订单恢复数量；旧任务缺失该字段时按零读取。
+	Restored int `json:"restored,omitempty"`
+	// Reassigned 是历史错误归属修正数量；与新增和同账号恢复分别统计。
+	Reassigned int `json:"reassigned,omitempty"`
 	// Discovered 是从平台发现并导入的新订单数量。
 	Discovered int `json:"discovered"`
 	// ListUpdated 是订单列表阶段发生字段变化的数量。
 	ListUpdated int `json:"list_updated"`
 	// SoftDeleted 是平台已不存在而被本地标记删除的数量。
 	SoftDeleted int `json:"soft_deleted"`
-	// DetailTotal 是进入详情补全阶段的订单数量。
+	// DetailTotal 是兼容旧任务契约的详情补全数量；批量列表同步固定为零。
 	DetailTotal int `json:"detail_total"`
-	// Total 是本次详情补全处理的订单总数量。
+	// Total 是兼容旧任务契约的详情处理总数；批量列表同步固定为零。
 	Total int `json:"total"`
-	// Updated 是详情补全后状态或字段发生变化的数量。
+	// Updated 是兼容旧任务契约的详情刷新变化数量；批量列表字段变化计入 ListUpdated。
 	Updated int `json:"updated"`
-	// NoChange 是详情补全后没有变化的数量。
+	// NoChange 是兼容旧任务契约的详情刷新未变化数量；批量列表同步固定为零。
 	NoChange int `json:"no_change"`
 	// Failed 是刷新过程中失败的数量。
 	Failed int `json:"failed"`
@@ -127,6 +131,7 @@ func NewRefreshJobResult(result RefreshResult) RefreshJobResult {
 		PartialFailure: result.PartialFailure,
 		Message:        result.Message,
 		Summary: RefreshJobSummary{
+			Restored: result.Summary.Restored, Reassigned: result.Summary.Reassigned,
 			Discovered: result.Summary.Discovered, ListUpdated: result.Summary.ListUpdated,
 			SoftDeleted: result.Summary.SoftDeleted, DetailTotal: result.Summary.DetailTotal,
 			Total: result.Summary.Total, Updated: result.Summary.Updated,

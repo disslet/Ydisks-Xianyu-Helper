@@ -13,6 +13,11 @@ type OrderRepository struct {
 	store *db.Store
 }
 
+// GetOwnerID 查询运行账号所属用户标识，不读取或解密账号平台凭证。
+func (r OrderRepository) GetOwnerID(ctx context.Context, cookieID string) (int64, error) {
+	return r.store.Cookies.GetOwnerID(ctx, cookieID)
+}
+
 // ExistsOwned 委托账号归属查询。
 func (r OrderRepository) ExistsOwned(ctx context.Context, userID int64, cookieID string) (bool, error) {
 	return r.store.Cookies.ExistsOwned(ctx, userID, cookieID)
@@ -118,10 +123,10 @@ func (r OrderRepository) FindOrder(ctx context.Context, orderID string) (*ordera
 	return orderFromDB(order), true, nil
 }
 
-// FindOrdersByIDs 委托数据库批量读取订单并转换为应用实体。
-func (r OrderRepository) FindOrdersByIDs(ctx context.Context, orderIDs []string) (map[string]*orderapp.Order, error) {
+// FindOrdersByIDs 只读取 cookieID 内的 orderIDs 并转换为应用实体；ctx 取消查询，SQL 账号过滤防止并发跨账号读取。
+func (r OrderRepository) FindOrdersByIDs(ctx context.Context, cookieID string, orderIDs []string) (map[string]*orderapp.Order, error) {
 	// orders、err 保存数据库批量订单及查询错误。
-	orders, err := r.store.Orders.FindByIDs(ctx, orderIDs)
+	orders, err := r.store.Orders.FindByIDsForAccount(ctx, cookieID, orderIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -132,6 +137,11 @@ func (r OrderRepository) FindOrdersByIDs(ctx context.Context, orderIDs []string)
 		converted[orderID] = orderFromDB(order)
 	}
 	return converted, nil
+}
+
+// FindChatIDsByBuyerAndItem 委托聊天仓储按账号、买家和商品查询候选会话。
+func (r OrderRepository) FindChatIDsByBuyerAndItem(ctx context.Context, cookieID, buyerID, itemID string) ([]string, error) {
+	return r.store.Chats.FindChatIDsByBuyerAndItem(ctx, cookieID, buyerID, itemID)
 }
 
 // GetItem 委托商品信息查询。
@@ -205,7 +215,7 @@ func (w orderWriter) UpsertOrder(ctx context.Context, orderID string, options or
 
 // UpsertOrder 委托订单写入。
 func (r OrderRepository) UpsertOrder(ctx context.Context, orderID string, opts orderapp.UpsertOptions) error {
-	return r.store.Orders.Upsert(ctx, orderID, db.OrderUpsertOpts{
+	return NormalizeOrderError(r.store.Orders.Upsert(ctx, orderID, db.OrderUpsertOpts{
 		ItemID: opts.ItemID, BuyerID: opts.BuyerID, CookieID: opts.CookieID,
 		CreatedAt:   opts.CreatedAt,
 		OrderStatus: opts.OrderStatus, SpecName: opts.SpecName, SpecValue: opts.SpecValue,
@@ -213,10 +223,10 @@ func (r OrderRepository) UpsertOrder(ctx context.Context, orderID string, opts o
 		ReceiverPhone: opts.ReceiverPhone, ReceiverAddr: opts.ReceiverAddress,
 		ReceiverCity: opts.ReceiverCity, ChatID: opts.ChatID,
 		IsBargain: opts.IsBargain, SystemShipped: opts.SystemShipped,
-	})
+	}))
 }
 
-// BatchUpsertOrders 委托订单详情分片的单条多值 UPSERT。
+// BatchUpsertOrders 将 rows 转换后委托仓储在同一事务内逐单执行归属与版本保护写入；ctx 控制取消，返回整批提交错误。
 func (r OrderRepository) BatchUpsertOrders(ctx context.Context, rows []orderapp.RefreshOrderWrite) error {
 	if len(rows) == 0 {
 		return nil
@@ -231,9 +241,9 @@ func (r OrderRepository) BatchUpsertOrders(ctx context.Context, rows []orderapp.
 		return errors.New("订单写入 Unit of Work 未初始化")
 	}
 	// transaction 是 db 层管理的详情分片事务，批量写入失败时不会留下部分订单。
-	return r.store.OrderWrites.WithTransaction(ctx, func(transaction *db.OrderWriteTransaction) error {
+	return NormalizeOrderError(r.store.OrderWrites.WithTransaction(ctx, func(transaction *db.OrderWriteTransaction) error {
 		return transaction.UpsertOrders(ctx, converted)
-	})
+	}))
 }
 
 // LockCredentials 委托账号凭证锁。

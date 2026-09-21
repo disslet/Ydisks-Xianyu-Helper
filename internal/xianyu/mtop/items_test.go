@@ -89,11 +89,11 @@ func TestFetchItemsPageMissingUnbCookie(t *testing.T) {
 	}
 }
 
-// TestFetchItemsPageEmptyCardList: SUCCESS 但 cardList 为空。
-func TestFetchItemsPageEmptyCardList(t *testing.T) {
-	// server 用于本次流程后续判断的server
+// TestFetchItemsPageMissingCardListMeansEmpty 验证闲鱼成功响应省略 cardList 时统一表示当前页没有商品。
+func TestFetchItemsPageMissingCardListMeansEmpty(t *testing.T) {
+	// server 返回现场验证过的空商品结构：成功、总数为零且不携带 cardList。
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"ret":["SUCCESS::调用成功"],"data":{}}`)
+		fmt.Fprint(w, `{"ret":["SUCCESS::调用成功"],"data":{"totalCount":0,"itemTopicList":[],"nextPage":false}}`)
 	}))
 	defer server.Close()
 
@@ -101,13 +101,64 @@ func TestFetchItemsPageEmptyCardList(t *testing.T) {
 	rt := &rewriteTransport{base: server.Client().Transport, target: server.URL}
 	// client 用于本次流程后续判断的client
 	client := &ClientImpl{HTTPClient: &http.Client{Transport: rt, Timeout: 5 * time.Second}}
-	// res、err 用于本次流程后续判断的res、err
+	// res、err 保存通用分页入口的空页结果及错误，商品同步和每日擦亮都会复用此入口。
 	res, err := client.FetchItemsPage(context.Background(), consignCookies, 1, 20)
-	if err != nil {
+	if err != nil || res == nil {
 		t.Fatalf("err=%v", err)
 	}
-	if len(res.Items) != 0 {
-		t.Fatalf("items=%d want 0", len(res.Items))
+	if len(res.Items) != 0 || res.CurrentCount != 0 || res.TotalCount != 0 {
+		t.Fatalf("缺少 cardList 的空页解析异常: result=%+v", res)
+	}
+}
+
+// TestFetchAllItemsAcceptsMissingCardListForEmptyAccount 验证全量同步与每日擦亮共用的查询可识别无商品账号。
+func TestFetchAllItemsAcceptsMissingCardListForEmptyAccount(t *testing.T) {
+	// server 返回无商品账号实测的成功结构，所有调用方都必须归一为可安全同步的空全集。
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"ret":["SUCCESS::调用成功"],"data":{"totalCount":0,"itemTopicList":[],"nextPage":false}}`)
+	}))
+	defer server.Close()
+
+	// client 将通用商品全集请求隔离到本地空列表服务。
+	client := &ClientImpl{HTTPClient: &http.Client{Transport: &rewriteTransport{base: server.Client().Transport, target: server.URL}}}
+	// result、err 保存普通全量同步查询的空列表结果和错误。
+	result, err := client.FetchAllItems(context.Background(), consignCookies, 20, 5)
+	if err != nil || result == nil || len(result.Items) != 0 || result.TotalCount != 0 || result.TotalPages != 1 {
+		t.Fatalf("无商品账号应成功返回空全集: result=%+v err=%v", result, err)
+	}
+}
+
+// TestFetchAllItemsAcceptsMissingCardListAndTotals 验证全量同步与每日擦亮共用的查询可识别无商品账号。
+func TestFetchAllItemsAcceptsMissingCardListAndTotals(t *testing.T) {
+	// server 返回同时省略商品列表与总数字段的成功结构，所有调用方都必须归一为可安全同步的空全集。
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"ret":["SUCCESS::调用成功"],"data":{"itemTopicList":[],"nextPage":false}}`)
+	}))
+	defer server.Close()
+
+	// client 将通用商品全集请求隔离到本地空列表服务。
+	client := &ClientImpl{HTTPClient: &http.Client{Transport: &rewriteTransport{base: server.Client().Transport, target: server.URL}}}
+	// result、err 保存普通全量同步查询的空列表结果和错误。
+	result, err := client.FetchAllItems(context.Background(), consignCookies, 20, 5)
+	if err != nil || result == nil || len(result.Items) != 0 || result.TotalCount != 0 || result.TotalPages != 1 {
+		t.Fatalf("无商品账号应成功返回空全集: result=%+v err=%v", result, err)
+	}
+}
+
+// TestFetchAllItemsAcceptsMissingCardListDespiteTotalMetadata 验证成功省略 cardList 时总数元数据不能改写权威空列表语义。
+func TestFetchAllItemsAcceptsMissingCardListDespiteTotalMetadata(t *testing.T) {
+	// server 保留此前的非零总数夹具，明确验证省略数组仍按成功空列表处理。
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"ret":["SUCCESS::调用成功"],"data":{"totalCount":1}}`)
+	}))
+	defer server.Close()
+
+	// client 将成功空列表请求隔离到本地 HTTP 服务。
+	client := &ClientImpl{HTTPClient: &http.Client{Transport: &rewriteTransport{base: server.Client().Transport, target: server.URL}}}
+	// result、err 保存权威省略数组语义下的完整空列表和错误。
+	result, err := client.FetchAllItems(context.Background(), consignCookies, 20, 5)
+	if err != nil || result == nil || result.TotalCount != 0 || len(result.Items) != 0 {
+		t.Fatalf("成功省略 cardList 不得因总数元数据报错: err=%v", err)
 	}
 }
 
@@ -178,7 +229,7 @@ func TestFetchItemsPageParseFailure(t *testing.T) {
 func TestFetchItemsPageDefaultsInvalidPage(t *testing.T) {
 	// server 用于本次流程后续判断的server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"ret":["SUCCESS::调用成功"],"data":{}}`)
+		fmt.Fprint(w, `{"ret":["SUCCESS::调用成功"],"data":{"cardList":[]}}`)
 	}))
 	defer server.Close()
 
@@ -306,17 +357,56 @@ func TestFetchAllItemsUsesRemotePageCountWhenPageIsShort(t *testing.T) {
 	}
 }
 
+// TestFetchAllItemsAutoPlaceholderDoesNotTruncate 验证平台占位卡不会让未知总页数的商品同步提前结束。
+func TestFetchAllItemsAutoPlaceholderDoesNotTruncate(t *testing.T) {
+	// pageReqs 记录商品列表实际请求页数，证明补齐只沿既有分页继续一次。
+	var pageReqs atomic.Int32
+	// server 模拟首页含占位卡、第二页为短页的商品列表接口。
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// page 是本次请求对应的平台页码，由调用次数稳定驱动测试响应。
+		page := pageReqs.Add(1)
+		if page == 1 {
+			fmt.Fprint(w, `{"ret":["SUCCESS::调用成功"],"data":{"cardList":[
+			  {"cardData":{"title":"平台占位卡","detailParams":{"itemId":"auto_guide"}}},
+			  {"cardData":{"title":"商品一","detailParams":{"itemId":"i1"}}}
+			]}}`)
+			return
+		}
+		fmt.Fprint(w, `{"ret":["SUCCESS::调用成功"],"data":{"cardList":[
+		  {"cardData":{"title":"商品二","detailParams":{"itemId":"i2"}}}
+		]}}`)
+	}))
+	defer server.Close()
+
+	// transport 把签名后的平台请求改写到本地测试服务，不访问真实闲鱼。
+	transport := &rewriteTransport{base: server.Client().Transport, target: server.URL}
+	// client 使用本地 HTTP 夹具执行真实分页和过滤逻辑。
+	client := &ClientImpl{HTTPClient: &http.Client{Transport: transport, Timeout: 5 * time.Second}}
+	// result、err 是两页完整同步结果及其错误。
+	result, err := client.FetchAllItems(context.Background(), consignCookies, 2, 3)
+	if err != nil {
+		t.Fatalf("含占位卡的完整分页不应失败: %v", err)
+	}
+	if pageReqs.Load() != 2 {
+		t.Fatalf("商品分页请求数=%d want 2", pageReqs.Load())
+	}
+	if len(result.Items) != 2 || result.Items[0].ID != "i1" || result.Items[1].ID != "i2" {
+		t.Fatalf("占位卡过滤后的商品全集=%+v", result.Items)
+	}
+}
+
 // TestFetchAllItemsMaxPagesCap: maxPages 限制最大页数。
 func TestFetchAllItemsMaxPagesCap(t *testing.T) {
 	// pageReqs 用于本次流程后续判断的页码Reqs
 	var pageReqs atomic.Int32
 	// server 用于本次流程后续判断的server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		pageReqs.Add(1)
+		// page 是当前夹具请求页，保证达到预算前不会因重复商品提前失败。
+		page := pageReqs.Add(1)
 		// 每页满（pageSize=1），但 maxPages=2 应只取 2 页
-		fmt.Fprint(w, `{"ret":["SUCCESS::调用成功"],"data":{"cardList":[
-		  {"cardData":{"title":"x","detailParams":{"itemId":"i1"}}}
-		]}}`)
+		fmt.Fprintf(w, `{"ret":["SUCCESS::调用成功"],"data":{"cardList":[
+		  {"cardData":{"title":"x","detailParams":{"itemId":"i%d"}}}
+		 ]}}`, page)
 	}))
 	defer server.Close()
 
@@ -329,11 +419,8 @@ func TestFetchAllItemsMaxPagesCap(t *testing.T) {
 	defer cancel()
 	// res、err 用于本次流程后续判断的res、err
 	res, err := client.FetchAllItems(ctx, consignCookies, 1, 2)
-	if err != nil {
-		t.Fatalf("err=%v", err)
-	}
-	if len(res.Items) != 2 {
-		t.Fatalf("items=%d want 2", len(res.Items))
+	if err == nil || res != nil || !strings.Contains(err.Error(), "页数上限") {
+		t.Fatalf("不完整分页不得返回可同步全集: result=%v err=%v", res, err)
 	}
 	if pageReqs.Load() != 2 {
 		t.Fatalf("pageReqs=%d want 2", pageReqs.Load())
@@ -347,7 +434,7 @@ func TestFetchAllItemsEmptyFirstPage(t *testing.T) {
 	// server 用于本次流程后续判断的server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		pageReqs.Add(1)
-		fmt.Fprint(w, `{"ret":["SUCCESS::调用成功"],"data":{}}`)
+		fmt.Fprint(w, `{"ret":["SUCCESS::调用成功"],"data":{"cardList":[]}}`)
 	}))
 	defer server.Close()
 
@@ -372,7 +459,7 @@ func TestFetchAllItemsEmptyFirstPage(t *testing.T) {
 func TestFetchAllItemsDefaultPageSize(t *testing.T) {
 	// server 用于本次流程后续判断的server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"ret":["SUCCESS::调用成功"],"data":{}}`)
+		fmt.Fprint(w, `{"ret":["SUCCESS::调用成功"],"data":{"cardList":[]}}`)
 	}))
 	defer server.Close()
 
@@ -558,6 +645,64 @@ func TestParseItemListNumericFields(t *testing.T) {
 	}
 }
 
+// TestParseItemListReadsMultiSpecFromCardData 验证商品列表卡片仅在 isSKU 为真时生成多规格标记。
+func TestParseItemListReadsMultiSpecFromCardData(t *testing.T) {
+	// data 模拟商品列表接口同时返回商品基础字段和多规格标记。
+	data := map[string]any{
+		"cardList": []any{
+			map[string]any{
+				"cardType": 1,
+				"cardData": map[string]any{
+					"title":        "列表多规格商品",
+					"priceInfo":    map[string]any{"price": "18", "preText": "¥"},
+					"detailParams": map[string]any{"itemId": "list-sku-item", "isSKU": true},
+				},
+			},
+		},
+	}
+	// items 保存列表卡片解析得到的本地同步模型。
+	items := parseItemList(data)
+	if len(items) != 1 || items[0].ID != "list-sku-item" || items[0].Title != "列表多规格商品" || items[0].PriceText != "¥18" || !items[0].IsMultiSpec {
+		t.Fatalf("列表多规格字段解析异常 items=%+v", items)
+	}
+}
+
+// TestParseItemListTreatsFalseSKUFieldAsSingleSpec 验证列表卡片显式 isSKU=false 与缺少该字段等价，均按普通单规格处理。
+func TestParseItemListTreatsFalseSKUFieldAsSingleSpec(t *testing.T) {
+	// data 模拟平台明确返回非多规格标记的商品列表卡片。
+	data := map[string]any{
+		"cardList": []any{map[string]any{
+			"cardData": map[string]any{
+				"detailParams": map[string]any{"itemId": "list-explicit-single-item", "isSKU": false},
+				"title":        "显式普通商品",
+			},
+		}},
+	}
+	// items 保存列表卡片解析得到的商品同步模型。
+	items := parseItemList(data)
+	if len(items) != 1 || items[0].ID != "list-explicit-single-item" || items[0].IsMultiSpec {
+		t.Fatalf("isSKU=false 的商品不应标记为多规格 items=%+v", items)
+	}
+}
+
+// TestParseItemListTreatsMissingSKUFieldAsSingleSpec 验证列表卡片缺少 isSKU 字段时按普通单规格处理。
+func TestParseItemListTreatsMissingSKUFieldAsSingleSpec(t *testing.T) {
+	// data 模拟已从多规格改为普通商品后的列表卡片，保留其他商品字段但移除 isSKU。
+	data := map[string]any{
+		"cardList": []any{map[string]any{
+			"cardData": map[string]any{
+				"detailParams": map[string]any{"itemId": "list-single-item"},
+				"title":        "列表普通商品",
+			},
+		}},
+	}
+	// items 保存列表卡片解析得到的商品同步模型。
+	items := parseItemList(data)
+	if len(items) != 1 || items[0].ID != "list-single-item" || items[0].IsMultiSpec {
+		t.Fatalf("缺少 isSKU 的商品不应标记为多规格 items=%+v", items)
+	}
+}
+
 // TestBuildItemListQuery 封装TestBuild商品List查询业务协调。
 func TestBuildItemListQuery(t *testing.T) {
 	// q 用于本次流程后续判断的q
@@ -566,5 +711,27 @@ func TestBuildItemListQuery(t *testing.T) {
 		!strings.Contains(q, "api=mtop.idle.web.xyh.item.list") ||
 		!strings.Contains(q, "spm_cnt=a21ybx.im.0.0") {
 		t.Fatalf("query=%q 缺字段", q)
+	}
+}
+
+// TestFetchItemsPageMissingCardListWithOnePage 验证空账号保留一页元数据时仍允许省略 cardList；t 使用本地 HTTP 夹具。
+func TestFetchItemsPageMissingCardListWithOnePage(t *testing.T) {
+	// server 返回现场验证过的空商品结构：成功、总数为零且不携带 cardList。
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"ret":["SUCCESS::调用成功"],"data":{"totalCount":0,"pageCount":1,"itemTopicList":[],"nextPage":false}}`)
+	}))
+	defer server.Close()
+
+	// rt 用于本次流程后续判断的rt
+	rt := &rewriteTransport{base: server.Client().Transport, target: server.URL}
+	// client 用于本次流程后续判断的client
+	client := &ClientImpl{HTTPClient: &http.Client{Transport: rt, Timeout: 5 * time.Second}}
+	// res、err 保存通用分页入口的空页结果及错误，商品同步和每日擦亮都会复用此入口。
+	res, err := client.FetchItemsPage(context.Background(), consignCookies, 1, 20)
+	if err != nil || res == nil {
+		t.Fatalf("err=%v", err)
+	}
+	if len(res.Items) != 0 || res.CurrentCount != 0 || res.TotalCount != 0 {
+		t.Fatalf("缺少 cardList 的空页解析异常: result=%+v", res)
 	}
 }

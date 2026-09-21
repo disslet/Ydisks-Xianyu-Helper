@@ -8,6 +8,10 @@ import (
 
 // refreshRepositoryFake 是订单刷新应用服务使用的内存持久化 Port。
 type refreshRepositoryFake struct {
+	// ownerID 是运行账号同步使用的非敏感所有者标识。
+	ownerID int64
+	// ownerIDErr 是读取运行账号所有者时返回的预置错误。
+	ownerIDErr error
 	// owned 保存账号归属关系。
 	owned map[string]bool
 	// order 保存订单实体。
@@ -22,12 +26,16 @@ type refreshRepositoryFake struct {
 	soldDeleteCount int
 	// upsertCount 保存订单写入次数。
 	upsertCount int
-	// batchUpsertCount 保存详情分片批量写入调用次数。
+	// batchUpsertCount 保存订单列表或详情批次批量写入调用次数。
 	batchUpsertCount int
 	// batchFindCount 保存订单发现批量读取调用次数。
 	batchFindCount int
 	// batchFindErr 保存测试批量读取错误。
 	batchFindErr error
+	// chatIDs 保存按买家和商品组合匹配出的测试会话标识。
+	chatIDs map[string][]string
+	// chatMatchErr 保存测试会话匹配错误。
+	chatMatchErr error
 	// batchUpsertErr 保存测试批量写入错误。
 	batchUpsertErr error
 	// transactionErr 保存事务错误。
@@ -44,6 +52,8 @@ type refreshRepositoryFake struct {
 	existsResult *bool
 	// rowsErr 保存详情目标扫描错误。
 	rowsErr error
+	// rowsCalls 保存批量刷新读取本地详情目标的调用次数；列表同步应保持为零。
+	rowsCalls int
 	// deleteErr 保存缺失订单清理错误。
 	deleteErr error
 	// updateCookieErr 保存扁平 Cookie 写入错误。
@@ -56,6 +66,17 @@ type refreshRepositoryFake struct {
 	loadErrors []error
 	// loadCalls 保存账号视图读取次数。
 	loadCalls int
+}
+
+// GetOwnerID 返回运行账号同步所需的测试所有者标识。
+func (f *refreshRepositoryFake) GetOwnerID(context.Context, string) (int64, error) {
+	if f.ownerIDErr != nil {
+		return 0, f.ownerIDErr
+	}
+	if f.ownerID > 0 {
+		return f.ownerID, nil
+	}
+	return 7, nil
 }
 
 // ExistsOwned 判断测试账号是否属于指定用户。
@@ -103,8 +124,8 @@ func (f *refreshRepositoryFake) FindOrder(_ context.Context, orderID string) (*O
 	return order, order != nil, err
 }
 
-// FindOrdersByIDs 返回测试订单发现批量读取结果。
-func (f *refreshRepositoryFake) FindOrdersByIDs(_ context.Context, orderIDs []string) (map[string]*Order, error) {
+// FindOrdersByIDs 返回 cookieID 内的测试订单；ctx 不访问外部资源，orderIDs 确定批量读取范围。
+func (f *refreshRepositoryFake) FindOrdersByIDs(_ context.Context, cookieID string, orderIDs []string) (map[string]*Order, error) {
 	f.batchFindCount++
 	if f.batchFindErr != nil {
 		return nil, f.batchFindErr
@@ -117,11 +138,21 @@ func (f *refreshRepositoryFake) FindOrdersByIDs(_ context.Context, orderIDs []st
 	// orderID 是当前批量读取的订单标识。
 	for _, orderID := range orderIDs {
 		// order 保存当前标识对应的测试订单。
-		if order := f.orders[orderID]; order != nil {
+		if order := f.orders[orderID]; order != nil && (order.CookieID == cookieID || order.CookieID == "") {
 			result[orderID] = order
 		}
 	}
 	return result, nil
+}
+
+// FindChatIDsByBuyerAndItem 返回测试账号下按买家和商品匹配的会话标识。
+func (f *refreshRepositoryFake) FindChatIDsByBuyerAndItem(_ context.Context, _, buyerID, itemID string) ([]string, error) {
+	if f.chatMatchErr != nil {
+		return nil, f.chatMatchErr
+	}
+	// key 保存测试买家与商品的组合键。
+	key := buyerID + "\x00" + itemID
+	return append([]string(nil), f.chatIDs[key]...), nil
 }
 
 // LockCredentials 返回无需等待的测试凭证锁。
@@ -170,11 +201,32 @@ func (f *refreshRepositoryFake) UpsertOrder(_ context.Context, orderID string, o
 		order = &Order{OrderID: orderID}
 		f.orders[orderID] = order
 	}
-	order.CookieID, order.CreatedAt, order.OrderStatus, order.Amount = options.CookieID, options.CreatedAt, options.OrderStatus, options.Amount
+	// options 中的非空字段模拟生产仓储的增量合并，避免未匹配会话覆盖已有关联。
+	if options.CookieID != "" {
+		order.CookieID = options.CookieID
+	}
+	if options.ItemID != "" {
+		order.ItemID = options.ItemID
+	}
+	if options.BuyerID != "" {
+		order.BuyerID = options.BuyerID
+	}
+	if options.ChatID != "" {
+		order.ChatID = options.ChatID
+	}
+	if options.CreatedAt != "" {
+		order.CreatedAt = options.CreatedAt
+	}
+	if options.OrderStatus != "" {
+		order.OrderStatus = options.OrderStatus
+	}
+	if options.Amount != "" {
+		order.Amount = options.Amount
+	}
 	return nil
 }
 
-// BatchUpsertOrders 记录测试详情分片批量写入。
+// BatchUpsertOrders 记录测试订单刷新批次批量写入。
 func (f *refreshRepositoryFake) BatchUpsertOrders(ctx context.Context, rows []RefreshOrderWrite) error {
 	f.batchUpsertCount++
 	if f.batchUpsertErr != nil {
@@ -200,6 +252,7 @@ func (f *refreshRepositoryFake) SoftDeleteMissingOrders(context.Context, string,
 
 // ListOrdersByCookieCursor 返回测试详情目标。
 func (f *refreshRepositoryFake) ListOrdersByCookieCursor(context.Context, string, int, string, string) ([]OrderRow, error) {
+	f.rowsCalls++
 	return f.rows, f.rowsErr
 }
 
@@ -240,6 +293,8 @@ type refreshRuntimeFake struct {
 	soldResult RefreshSoldFetchResult
 	// fetchErr 保存平台请求错误。
 	fetchErr error
+	// detailErr 保存仅订单详情请求使用的预置错误；为空时沿用 fetchErr。
+	detailErr error
 	// expired 表示请求错误是否为会话过期。
 	expired bool
 	// recovered 保存是否执行了会话恢复。
@@ -264,6 +319,10 @@ type refreshRuntimeFake struct {
 	persistErr error
 	// recoverCalls 保存会话恢复调用次数。
 	recoverCalls int
+	// chatRefresh 保存按需刷新聊天联系人的测试回调。
+	chatRefresh func(context.Context, string) error
+	// chatRefreshCalls 保存按需刷新聊天联系人的调用次数。
+	chatRefreshCalls int
 }
 
 // DetailAvailable 返回详情接口可用状态。
@@ -288,7 +347,10 @@ func (f *refreshRuntimeFake) FetchOrderDetail(context.Context, *PlatformRuntimeD
 		result = f.detailResults[index]
 	}
 	// fetchErr 保存本次详情请求的预置错误。
-	fetchErr := f.fetchErr
+	fetchErr := f.detailErr
+	if fetchErr == nil {
+		fetchErr = f.fetchErr
+	}
 	if index < len(f.detailErrors) {
 		fetchErr = f.detailErrors[index]
 	}
@@ -323,6 +385,15 @@ func (f *refreshRuntimeFake) RecoverExpiredSession(context.Context, string, erro
 // IsSessionExpired 返回预置会话过期标记。
 func (f *refreshRuntimeFake) IsSessionExpired(error) bool { return f.expired }
 
+// RefreshChatConversations 执行测试预置的聊天联系人刷新回调。
+func (f *refreshRuntimeFake) RefreshChatConversations(ctx context.Context, cookieID string) error {
+	f.chatRefreshCalls++
+	if f.chatRefresh == nil {
+		return nil
+	}
+	return f.chatRefresh(ctx, cookieID)
+}
+
 // TestRefreshSingleSuccess 验证单订单刷新会写入详情并返回兼容结果。
 func TestRefreshSingleSuccess(t *testing.T) {
 	// repository 保存本用例的内存持久化依赖。
@@ -356,8 +427,8 @@ func TestRefreshSingleRejectsUnsupportedAndCredentialChanges(t *testing.T) {
 	}
 }
 
-// TestRefreshBatchDiscoveryAndDetails 验证批量刷新会发现订单、清理缺失记录并补全详情。
-func TestRefreshBatchDiscoveryAndDetails(t *testing.T) {
+// TestRefreshBatchDiscoveryUsesSoldListOnly 验证批量刷新只写入已售列表字段且不请求订单详情。
+func TestRefreshBatchDiscoveryUsesSoldListOnly(t *testing.T) {
 	// repository 保存批量刷新使用的内存持久化依赖。
 	repository := &refreshRepositoryFake{
 		owned:           map[string]bool{"cookie-1": true},
@@ -369,14 +440,16 @@ func TestRefreshBatchDiscoveryAndDetails(t *testing.T) {
 	// runtime 保存批量刷新使用的平台运行时依赖。
 	runtime := &refreshRuntimeFake{
 		soldAvailable: true, detailAvailable: true,
-		soldResult:   RefreshSoldFetchResult{Orders: []RefreshSoldOrder{{OrderID: "order-1", OrderStatus: "2", Amount: "¥12.00"}, {OrderID: "order-2", OrderStatus: "2"}}},
-		detailResult: RefreshDetailFetchResult{Detail: &RefreshDetail{OrderStatus: "3", Amount: "12.00"}},
+		soldResult: RefreshSoldFetchResult{Orders: []RefreshSoldOrder{{OrderID: "order-1", OrderStatus: "pending_ship", Amount: "¥12.00"}, {OrderID: "order-2", OrderStatus: "pending_ship"}}},
+		detailErr:  errors.New("批量同步不应调用订单详情"),
 	}
 	// result、err 保存批量刷新结果和错误。
-	// result 保存批量刷新结果。
 	result, err := NewRefreshService(repository, runtime, 1).Refresh(context.Background(), 7, "", "all")
-	if err != nil || result.Summary.Discovered != 1 || result.Summary.SoftDeleted != 1 || result.Summary.DetailTotal == 0 || repository.upsertCount == 0 || repository.batchFindCount != 1 || repository.batchUpsertCount != 2 {
+	if err != nil || result.Summary.Discovered != 1 || result.Summary.SoftDeleted != 1 || result.Summary.DetailTotal != 0 || result.Summary.Total != 0 || result.Summary.Updated != 0 || result.Summary.NoChange != 0 || runtime.detailCalls != 0 || repository.rowsCalls != 0 || repository.upsertCount == 0 || repository.batchFindCount != 1 || repository.batchUpsertCount != 1 {
 		t.Fatalf("批量刷新结果异常: result=%+v err=%v repository=%+v", result, err, repository)
+	}
+	if repository.orders["order-2"].OrderStatus != "pending_ship" || repository.orders["order-1"].Amount != "12.00" {
+		t.Fatalf("已售列表字段未正确落库: orders=%+v", repository.orders)
 	}
 }
 
@@ -394,6 +467,150 @@ func TestPersistSoldOrdersBatchesLookupAndWrite(t *testing.T) {
 	})
 	if err != nil || discovered != 1 || updated != 1 || len(newIDs) != 1 || len(remoteIDs) != 2 || repository.batchFindCount != 1 || repository.batchUpsertCount != 1 || repository.upsertCount != 2 || repository.orders["existing"].OrderStatus != "processing" || repository.orders["existing"].CreatedAt != "2024-01-02T03:04:05Z" || repository.orders["new-order"].CreatedAt != "2024-01-03T03:04:05Z" {
 		t.Fatalf("批量订单发现结果异常: discovered=%d updated=%d new=%v remote=%v repository=%+v err=%v", discovered, updated, newIDs, remoteIDs, repository, err)
+	}
+}
+
+// TestPersistSoldOrdersBackfillsUniqueChatID 验证订单同步能以账号、买家和商品唯一回填聊天会话。
+func TestPersistSoldOrdersBackfillsUniqueChatID(t *testing.T) {
+	// repository 保存唯一会话匹配结果和订单写入状态。
+	repository := &refreshRepositoryFake{chatIDs: map[string][]string{"buyer-1\x00item-1": {"chat-1"}}}
+	// service 保存仅用于调用订单发现持久化的应用服务。
+	service := &RefreshService{repository: repository}
+	// discovered、updated、newIDs、remoteIDs、err 保存本次订单同步结果。
+	discovered, updated, newIDs, remoteIDs, err := service.persistSoldOrders(context.Background(), "cookie-1", []RefreshSoldOrder{{
+		OrderID: "order-1", ItemID: "item-1", BuyerID: "buyer-1", OrderStatus: "pending_ship", Amount: "3.00",
+	}})
+	// order 保存同步后可供完整发货使用的本地订单。
+	order := repository.orders["order-1"]
+	if err != nil || discovered != 1 || updated != 0 || len(newIDs) != 1 || len(remoteIDs) != 1 || order == nil || order.ChatID != "chat-1" {
+		t.Fatalf("同步会话回填异常: discovered=%d updated=%d new=%v remote=%v order=%+v err=%v", discovered, updated, newIDs, remoteIDs, order, err)
+	}
+}
+
+// TestRefreshRuntimeAccountUsesNonSensitiveOwner 验证运行实例就绪后的同步先读取非敏感归属，再复用指定账号刷新。
+func TestRefreshRuntimeAccountUsesNonSensitiveOwner(t *testing.T) {
+	// repository 保存仅允许 account-ready 账号完成同步的内存仓储。
+	repository := &refreshRepositoryFake{
+		ownerID: 11, owned: map[string]bool{"cookie-1": true},
+		detail: &PlatformRuntimeData{ID: "cookie-1", UserID: 11, Value: "cookie"},
+		orders: map[string]*Order{},
+	}
+	// runtime 保存返回一条已完成订单列表事实的平台替身，详情接口关闭以验证状态来自列表同步。
+	runtime := &refreshRuntimeFake{soldAvailable: true, soldResult: RefreshSoldFetchResult{Orders: []RefreshSoldOrder{{OrderID: "completed-order", OrderStatus: "completed"}}}}
+	// service 保存需要验证运行账号同步入口的订单服务。
+	service := NewRefreshService(repository, runtime, 100)
+	// result、refreshErr 保存运行账号订单同步的结果。
+	result, refreshErr := service.RefreshRuntimeAccount(context.Background(), " cookie-1 ")
+	if refreshErr != nil || result.Summary.Discovered != 1 || repository.orders["completed-order"] == nil || repository.orders["completed-order"].OrderStatus != "completed" {
+		t.Fatalf("运行账号同步结果异常: result=%+v order=%+v err=%v", result, repository.orders["completed-order"], refreshErr)
+	}
+}
+
+// TestRefreshRuntimeAccountRejectsEmptyAccount 验证空运行账号标识不读取归属也不访问平台。
+func TestRefreshRuntimeAccountRejectsEmptyAccount(t *testing.T) {
+	// repository 保存不应被调用的测试仓储。
+	repository := &refreshRepositoryFake{}
+	// runtime 保存不应被调用的平台替身。
+	runtime := &refreshRuntimeFake{}
+	// service 保存待校验输入保护的订单服务。
+	service := NewRefreshService(repository, runtime, 100)
+	// refreshErr 保存空账号标识的拒绝结果。
+	_, refreshErr := service.RefreshRuntimeAccount(context.Background(), " ")
+	if refreshErr == nil || repository.loadCalls != 0 {
+		t.Fatalf("空账号标识不应继续同步: load=%d err=%v", repository.loadCalls, refreshErr)
+	}
+}
+
+// TestPersistSoldOrdersRefreshesChatsAndRetriesMatch 验证首次匹配不到时只刷新一次聊天并重试关联。
+func TestPersistSoldOrdersRefreshesChatsAndRetriesMatch(t *testing.T) {
+	// repository 保存首次为空、刷新后出现候选会话的内存状态。
+	repository := &refreshRepositoryFake{chatIDs: map[string][]string{}}
+	// runtime 保存刷新聊天后补入候选会话的测试运行时。
+	runtime := &refreshRuntimeFake{chatRefresh: func(_ context.Context, cookieID string) error {
+		if cookieID != "cookie-1" {
+			t.Fatalf("聊天刷新账号错误: %q", cookieID)
+		}
+		repository.chatIDs["buyer-1\x00item-1"] = []string{"chat-after-refresh"}
+		return nil
+	}}
+	// service 保存订单发现持久化及可选聊天刷新能力。
+	service := &RefreshService{repository: repository, runtime: runtime}
+	// prepareErr 保存锁外联系人准备结果，后续持久化只读取缓存。
+	if prepareErr := service.prepareSoldChats(context.Background(), "cookie-1", []RefreshSoldOrder{{OrderID: "order-1", ItemID: "item-1", BuyerID: "buyer-1"}}); prepareErr != nil {
+		t.Fatal(prepareErr)
+	}
+
+	// discovered、updated、newIDs、remoteIDs、err 保存聊天刷新重试后的订单同步结果。
+	discovered, updated, newIDs, remoteIDs, err := service.persistSoldOrders(context.Background(), "cookie-1", []RefreshSoldOrder{{
+		OrderID: "order-1", ItemID: "item-1", BuyerID: "buyer-1", OrderStatus: "pending_ship", Amount: "3.00",
+	}})
+	// order 保存刷新聊天后回填会话的订单。
+	order := repository.orders["order-1"]
+	if err != nil || discovered != 1 || updated != 0 || len(newIDs) != 1 || len(remoteIDs) != 1 || runtime.chatRefreshCalls != 1 || order == nil || order.ChatID != "chat-after-refresh" {
+		t.Fatalf("聊天刷新重试异常: discovered=%d updated=%d new=%v remote=%v refresh=%d order=%+v err=%v", discovered, updated, newIDs, remoteIDs, runtime.chatRefreshCalls, order, err)
+	}
+}
+
+// TestPersistSoldOrdersKeepsSyncWhenChatRefreshFails 验证聊天刷新失败时订单仍能同步且不会伪造会话关联。
+func TestPersistSoldOrdersKeepsSyncWhenChatRefreshFails(t *testing.T) {
+	// repository 保存没有本地候选会话的内存状态。
+	repository := &refreshRepositoryFake{chatIDs: map[string][]string{}}
+	// refreshErr 保存预置的聊天联系人刷新失败原因。
+	refreshErr := errors.New("聊天联系人暂时不可用")
+	// runtime 保存返回聊天刷新错误的测试运行时。
+	runtime := &refreshRuntimeFake{chatRefresh: func(context.Context, string) error { return refreshErr }}
+	// service 保存订单发现持久化及可选聊天刷新能力。
+	service := &RefreshService{repository: repository, runtime: runtime}
+	// prepareErr 保存锁外联系人准备结果，后续持久化只读取缓存。
+	if prepareErr := service.prepareSoldChats(context.Background(), "cookie-1", []RefreshSoldOrder{{OrderID: "order-1", ItemID: "item-1", BuyerID: "buyer-1"}}); prepareErr != nil {
+		t.Fatal(prepareErr)
+	}
+
+	// _, _, _, _, err 保存聊天刷新失败后的订单同步结果。
+	_, _, _, _, err := service.persistSoldOrders(context.Background(), "cookie-1", []RefreshSoldOrder{{
+		OrderID: "order-1", ItemID: "item-1", BuyerID: "buyer-1", OrderStatus: "pending_ship",
+	}})
+	// order 保存聊天刷新失败后仍应落库的订单。
+	order := repository.orders["order-1"]
+	if err != nil || runtime.chatRefreshCalls != 1 || repository.batchUpsertCount != 1 || order == nil || order.ChatID != "" {
+		t.Fatalf("聊天刷新失败不应阻断订单同步: refresh=%d batch=%d order=%+v err=%v", runtime.chatRefreshCalls, repository.batchUpsertCount, order, err)
+	}
+}
+
+// TestPersistSoldOrdersDoesNotGuessAmbiguousChatID 验证多个候选会话时不会擅自选择错误会话。
+func TestPersistSoldOrdersDoesNotGuessAmbiguousChatID(t *testing.T) {
+	// repository 保存多个候选会话及已有订单的内存状态。
+	repository := &refreshRepositoryFake{
+		orders:  map[string]*Order{"order-1": {OrderID: "order-1", CookieID: "cookie-1", ChatID: "old-chat"}},
+		chatIDs: map[string][]string{"buyer-1\x00item-1": {"chat-1", "chat-2"}},
+	}
+	// service 保存仅用于调用订单发现持久化的应用服务。
+	service := &RefreshService{repository: repository}
+	// _, _, _, _, err 保存多会话歧义下的订单同步结果。
+	_, _, _, _, err := service.persistSoldOrders(context.Background(), "cookie-1", []RefreshSoldOrder{{
+		OrderID: "order-1", ItemID: "item-1", BuyerID: "buyer-1", OrderStatus: "pending_ship", Amount: "3.00",
+	}})
+	// order 保存同步后仍应保留的原聊天会话。
+	order := repository.orders["order-1"]
+	if err != nil || order == nil || order.ChatID != "old-chat" {
+		t.Fatalf("多会话不应猜测 chat_id: order=%+v err=%v", order, err)
+	}
+}
+
+// TestPersistSoldOrdersReturnsChatMatchError 验证会话匹配失败会阻止订单批量写入并返回原因。
+func TestPersistSoldOrdersReturnsChatMatchError(t *testing.T) {
+	// matchErr 保存预置的会话匹配错误。
+	matchErr := errors.New("会话查询失败")
+	// repository 保存返回会话匹配错误的内存依赖。
+	repository := &refreshRepositoryFake{chatMatchErr: matchErr}
+	// service 保存订单刷新应用服务。
+	service := &RefreshService{repository: repository}
+	// _, _, _, _, err 保存会话匹配失败结果。
+	_, _, _, _, err := service.persistSoldOrders(context.Background(), "cookie-1", []RefreshSoldOrder{{
+		OrderID: "failed-chat-order", ItemID: "item-1", BuyerID: "buyer-1", OrderStatus: "pending_ship",
+	}})
+	if err == nil || !errors.Is(err, matchErr) || repository.batchUpsertCount != 0 {
+		t.Fatalf("会话匹配失败结果异常: batch=%d err=%v", repository.batchUpsertCount, err)
 	}
 }
 

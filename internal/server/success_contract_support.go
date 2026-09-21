@@ -31,6 +31,18 @@ type aiModelsResponse struct {
 	Models []string `json:"models"`
 }
 
+// aiConnectionTestResponse 是 AI 连接测试接口的具名响应 DTO。
+type aiConnectionTestResponse struct {
+	// Success 表示连接测试是否成功。
+	Success bool `json:"success"`
+	// Model 是实际被测试的模型名称。
+	Model string `json:"model"`
+	// LatencyMS 是从发送请求到收到响应的毫秒数。
+	LatencyMS int64 `json:"latency_ms"`
+	// Reply 是模型回复正文摘要（最多 100 字符）。
+	Reply string `json:"reply"`
+}
+
 // userSettingResponse 是单个用户设置查询接口的具名响应 DTO。
 type userSettingResponse struct {
 	// Value 是设置值文本。
@@ -388,8 +400,10 @@ type keywordTypedResponse struct {
 	Keyword string `json:"keyword"`
 	// Reply 是文字回复内容。
 	Reply string `json:"reply"`
-	// ItemID 是限定的商品标识。
+	// ItemID 是限定的商品标识；多选规则取 ItemIDs 首项以保持兼容。
 	ItemID string `json:"item_id"`
+	// ItemIDs 是限定的商品标识集合；空集合表示账号级回复。
+	ItemIDs []string `json:"item_ids"`
 	// Type 是回复类型。
 	Type string `json:"type"`
 	// ImageURL 是图片回复地址。

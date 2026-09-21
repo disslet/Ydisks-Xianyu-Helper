@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // GetRun 返回自动化运行及动作检查点，并在执行动作前恢复发货凭证。
@@ -38,6 +39,113 @@ func (a *AutomationRules) GetRun(ctx context.Context, id int64) (*AutomationRun,
 	}
 	run.DeliveryProof = proof
 	return &run, nil
+}
+
+// GetRunByRuleAndTrigger 读取同一规则和幂等键的运行快照；ctx 控制查询取消，未找到返回 ErrNotFound。
+// 该方法只供自动化编排判断能否原样补发，返回的发货内容始终保持在加密仓储边界内。
+func (a *AutomationRules) GetRunByRuleAndTrigger(ctx context.Context, ruleID int64, triggerKey string) (*AutomationRun, error) {
+	// runID 保存唯一运行记录标识；readErr 表示按规则和幂等键查询失败。
+	var runID int64
+	// readErr 保存按规则和幂等键读取自动化运行失败的数据库错误。
+	readErr := a.DB.QueryRowContext(ctx, `SELECT id FROM automation_runs WHERE rule_id=? AND trigger_key=?`, ruleID, triggerKey).Scan(&runID)
+	if readErr != nil {
+		if errors.Is(readErr, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, readErr
+	}
+	return a.GetRun(ctx, runID)
+}
+
+// GetLatestOrderDeliveryRun 读取订单最近一次付款发货运行；ctx 控制查询取消，cookieID 防止跨账号复用快照。
+// 返回的快照可能来自自动或人工流程，调用方必须先根据运行终态决定补发、仅补记状态或人工核对。
+func (a *AutomationRules) GetLatestOrderDeliveryRun(ctx context.Context, cookieID, orderID string) (*AutomationRun, error) {
+	// runID 保存同一账号订单最近更新的付款发货运行标识；readErr 表示读取失败。
+	var runID int64
+	// readErr 保存读取同一订单最近付款发货运行失败的数据库错误。
+	readErr := a.DB.QueryRowContext(ctx, `SELECT id FROM automation_runs
+		WHERE cookie_id=? AND order_id=? AND trigger_type='order_paid'
+		ORDER BY updated_at DESC,id DESC LIMIT 1`, cookieID, orderID).Scan(&runID)
+	if readErr != nil {
+		if errors.Is(readErr, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, readErr
+	}
+	return a.GetRun(ctx, runID)
+}
+
+// ClaimDeliveryReplay 原子领取失败或人工核对运行的内容补发权，避免并发人工请求重复发送同一快照。
+// 返回的 attempt 是领取成功后的新代次；leaseExpiresAt 限制运行中的补发占用时间。
+func (a *AutomationRules) ClaimDeliveryReplay(ctx context.Context, runID int64, expectedAttempt int, leaseExpiresAt int64) (attempt int, claimed bool, err error) {
+	// now 保存当前 UTC 秒时间，用于拒绝已经过期的补发租约输入。
+	now := time.Now().UTC().Unix()
+	if leaseExpiresAt <= now {
+		return expectedAttempt, false, fmt.Errorf("补发租约必须晚于当前时间")
+	}
+	// result、updateErr 保存条件领取更新及其数据库错误；状态和代次共同构成单个补发执行者的所有权。
+	result, updateErr := a.DB.ExecContext(ctx, `UPDATE automation_runs
+		SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,action_started=1,updated_at=CURRENT_TIMESTAMP
+		WHERE id=? AND attempt_count=? AND status IN ('failed','needs_review') AND delivery_proof<>''`, leaseExpiresAt, runID, expectedAttempt)
+	if updateErr != nil {
+		return expectedAttempt, false, updateErr
+	}
+	// affected、affectedErr 保存实际领取行数及读取更新结果错误；零行表示已被其他请求或状态迁移占用。
+	affected, affectedErr := result.RowsAffected()
+	if affectedErr != nil {
+		return expectedAttempt, false, affectedErr
+	}
+	if affected != 1 {
+		return expectedAttempt, false, nil
+	}
+	return expectedAttempt + 1, true, nil
+}
+
+// ReleaseDeliveryReplay 在补发尚未成功收口时恢复终态；恢复到 needs_review 会保留动作占用标志以禁止整批重试。
+// runID 和 attempt 只允许当前补发领取者释放，避免旧请求覆盖新的执行代次。
+func (a *AutomationRules) ReleaseDeliveryReplay(ctx context.Context, runID int64, attempt int, restoreStatus, reason string) error {
+	if restoreStatus != "failed" && restoreStatus != "needs_review" {
+		return fmt.Errorf("补发运行不能恢复到状态 %q", restoreStatus)
+	}
+	// result、updateErr 保存失败补发的条件释放更新及其数据库错误。
+	result, updateErr := a.DB.ExecContext(ctx, `UPDATE automation_runs
+		SET status=?,error_message=?,lease_expires_at=0,action_started=CASE WHEN ?='needs_review' THEN 1 ELSE 0 END,updated_at=CURRENT_TIMESTAMP
+		WHERE id=? AND attempt_count=? AND status='running' AND action_started=1`, restoreStatus, reason, restoreStatus, runID, attempt)
+	if updateErr != nil {
+		return updateErr
+	}
+	return requireAutomationRunOwner(result)
+}
+
+// CompleteDeliveryReplay 将已经原样补发并完成确认发货的已领取运行收口为成功。
+// ctx 控制数据库更新；runID 和 attempt 防止旧 worker 覆盖新代次，快照必须继续保留给后续审计。
+func (a *AutomationRules) CompleteDeliveryReplay(ctx context.Context, runID int64, attempt int) error {
+	// result、updateErr 保存终态收口更新及其数据库错误；attempt 和补发领取状态共同隔离旧 worker。
+	result, updateErr := a.DB.ExecContext(ctx, `UPDATE automation_runs
+		SET status='success',error_message='',lease_expires_at=0,next_retry_at=0,action_started=0,updated_at=CURRENT_TIMESTAMP
+		WHERE id=? AND attempt_count=? AND status='running' AND action_started=1`, runID, attempt)
+	if updateErr != nil {
+		return updateErr
+	}
+	return requireAutomationRunOwner(result)
+}
+
+// UpdateDeliveryReplayProof 保存补发期间新取得的发货快照，只有当前补发代次可以写入。
+// proof 必须包含已经生成的全部内容；取卡前先保存 RefillPending，结果写入失败时保留该标记禁止再次取卡。
+func (a *AutomationRules) UpdateDeliveryReplayProof(ctx context.Context, runID int64, attempt int, proof AutomationDeliveryProof) error {
+	// encryptedProof 保存按运行作用域加密后的补发快照。
+	encryptedProof, err := a.encodeDeliveryProof(runID, proof)
+	if err != nil {
+		return err
+	}
+	// result、updateErr 保存当前补发代次的条件写回结果及数据库错误。
+	result, updateErr := a.DB.ExecContext(ctx, `UPDATE automation_runs
+		SET delivery_proof=?,updated_at=CURRENT_TIMESTAMP
+		WHERE id=? AND attempt_count=? AND status='running' AND action_started=1`, encryptedProof, runID, attempt)
+	if updateErr != nil {
+		return updateErr
+	}
+	return requireAutomationRunOwner(result)
 }
 
 // AdvanceRunAction 在动作明确成功后原子推进游标、累计数量并保存或清除发货凭证。

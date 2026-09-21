@@ -85,7 +85,7 @@ type OrderDetailFetcher interface {
 	FetchOrderDetail(ctx context.Context, cookieID, orderID, itemID, buyerID, cookieStr string) (*OrderDetail, error)
 }
 
-// CredentialRecoverer 在平台明确返回 Session 失效时执行一次凭证恢复。
+// CredentialRecoverer 仅在平台明确返回 Session 失效时执行一次账号恢复；Token 过期由 MTOP 客户端内部刷新。
 type CredentialRecoverer interface {
 	RecoverExpiredCredential(ctx context.Context, cookieID string) bool
 }
@@ -209,6 +209,7 @@ func NewWithDependencies(store *db.Store, senders SenderProvider, logger *slog.L
 		current: func() Notifier {
 			return center.dependencies.notifier
 		},
+		logger: center.logger,
 	}
 	center.taskRunner = accountTaskCoordinator{
 		repository: newStoreAccountTaskRepository(store),
@@ -237,7 +238,25 @@ func NewWithDependencies(store *db.Store, senders SenderProvider, logger *slog.L
 
 // RunAccountTask 执行指定账号任务，并保持 Center 的公开兼容入口。
 func (c *Center) RunAccountTask(ctx context.Context, accountID, taskType string) (AccountTaskSummary, error) {
-	return c.taskRunner.runAccountTask(ctx, accountID, taskType)
+	if c == nil || c.taskRunner.repository == nil {
+		return AccountTaskSummary{TaskType: taskType}, errors.New("账号任务协调器未初始化")
+	}
+	// summary、err 保存账号任务执行结果及其错误，供日志和兼容调用方共同使用。
+	summary, err := c.taskRunner.runAccountTask(ctx, accountID, taskType)
+	if c.logger == nil {
+		return summary, err
+	}
+	if err != nil {
+		if errors.Is(err, errAccountTaskCredentialRenewed) {
+			c.logger.Info("手动账号任务因凭证续期暂停，等待下一次执行", "account", accountID, "task", taskType, "err", err)
+		} else {
+			c.logger.Warn("手动账号任务执行失败", "account", accountID, "task", taskType, "err", err)
+		}
+		return summary, err
+	}
+	c.logger.Info("手动账号任务执行成功", "account", accountID, "task", taskType,
+		"found", summary.Found, "success", summary.Success, "failed", summary.Failed, "skipped", summary.Skipped)
+	return summary, nil
 }
 
 // scanAccountTasks 扫描启用的账号任务，并委托给账号任务协调器。
@@ -261,6 +280,44 @@ func (c *Center) handleTask(ctx context.Context, task Task) (bool, error) {
 	if task.TriggerType == "" || task.AccountID == "" {
 		return false, nil
 	}
+	// 简化付款消息只有会话标识，先从本账号待发货订单回填订单事实，再记录事件和匹配规则。
+	if // resolveErr 保存简化消息订单事实回填错误
+	resolvedTask, resolveErr := c.resolvePaidTaskOrder(ctx, task); resolveErr != nil {
+		return false, resolveErr
+	} else {
+		task = resolvedTask
+	}
+	// unknownRoleTask 标记本次 WebSocket 交易事件是否未携带明确角色；仅该类事件需要记录本地卖家事实核验的放行日志。
+	unknownRoleTask := task.OrderRole == OrderRoleUnknown && isWebSocketSellerOrderTask(task)
+	// verifiedTask、sellerVerified、rejectReason 保存未知角色事件的本地卖家核验结果；失败时在事实写入前停止，避免把买家订单落到卖家账号。
+	verifiedTask, sellerVerified, rejectReason, roleErr := c.authorizeWebSocketSellerTask(ctx, task)
+	if roleErr != nil {
+		return false, roleErr
+	}
+	if !sellerVerified {
+		if roleVerificationRetryable(rejectReason) {
+			if isDeferredReplay(task) {
+				// 未知角色延期任务再次没有本地证据时交给统一退避；达到上限后由调度器发送人工处理通知。
+				return false, errSellerRoleEvidencePending
+			}
+			// deferErr 保存首条未知角色事件写入延期队列的错误；写入失败不能伪装成已安全处理。
+			if deferErr := c.deferUnknownRoleTask(ctx, task, rejectReason); deferErr != nil {
+				return false, deferErr
+			}
+			if c.logger != nil {
+				c.logger.Info("未知角色发货事件已保存，等待本地卖家事实", "account", task.AccountID, "order_id", task.OrderID, "trigger", task.TriggerType, "reason", rejectReason)
+			}
+			return true, nil
+		}
+		if c.logger != nil {
+			c.logger.Info("未知角色发货事件未通过本地卖家核验，未执行外部动作", "account", task.AccountID, "order_id", task.OrderID, "trigger", task.TriggerType, "reason", rejectReason)
+		}
+		return false, nil
+	}
+	if unknownRoleTask && c.logger != nil {
+		c.logger.Info("未知角色交易事件已通过本地卖家核验，继续执行自动化", "account", verifiedTask.AccountID, "order_id", verifiedTask.OrderID, "item_id", verifiedTask.ItemID, "trigger", verifiedTask.TriggerType, "source", verifiedTask.Source)
+	}
+	task = verifiedTask
 	if // err 用于本次流程后续判断的err
 	err := c.facts.record(ctx, task); err != nil {
 		if errors.Is(err, db.ErrForbidden) {
@@ -300,6 +357,24 @@ func (c *Center) handleTask(ctx context.Context, task Task) (bool, error) {
 		c.logger.Info("账号已停用，记录事件事实但不执行自动化", "account", task.AccountID, "trigger", task.TriggerType)
 		return false, nil
 	}
+	if task.TriggerType == TriggerBargainPending {
+		return c.handleBargainPending(ctx, task)
+	}
+	if task.TriggerType == TriggerOrderCompleted {
+		// 买家确认收货事件只更新本地订单完成事实，自动评价由账号任务扫描该事实后独立执行。
+		return true, nil
+	}
+	if task.TriggerType == TriggerOrderPaid && !task.ForceConfirmShipment {
+		// autoConfirm、autoConfirmErr 分别保存参考项目自动发货入口要求的账号开关和读取错误。
+		autoConfirm, autoConfirmErr := c.store.Cookies.GetAutoConfirm(ctx, task.AccountID)
+		if autoConfirmErr != nil {
+			return false, fmt.Errorf("读取自动确认发货设置: %w", autoConfirmErr)
+		}
+		if !autoConfirm {
+			c.logger.Info("账号未启用自动确认发货，跳过付款自动发货", "account", task.AccountID, "order_id", task.OrderID)
+			return false, nil
+		}
+	}
 	// aiPricingActive 表示订单创建事件已由互斥的 AI 议价模式接管；aiPricingErr 是报价执行或状态收口错误。
 	if aiPricingActive, aiPricingErr := c.handleAIPricingMode(ctx, task); aiPricingActive || aiPricingErr != nil {
 		return false, aiPricingErr
@@ -310,7 +385,7 @@ func (c *Center) handleTask(ctx context.Context, task Task) (bool, error) {
 		return false, err
 	}
 	if len(rules) == 0 {
-		c.logger.Debug("无匹配自动化规则，忽略事件", "trigger", task.TriggerType, "order_id", task.OrderID, "item_id", task.ItemID)
+		c.logger.Warn("未匹配商品规则或已确认的账号通用规则，未执行自动化", "trigger", task.TriggerType, "order_id", task.OrderID, "item_id", task.ItemID)
 		return false, nil
 	}
 	// firstErr 用于本次流程后续判断的firstErr
@@ -344,6 +419,80 @@ func (c *Center) handleTask(ctx context.Context, task Task) (bool, error) {
 	return false, firstErr
 }
 
+// handleBargainPending 处理砍价“待刀成”WS 阶段：仅按独立账号开关调用免拼，绝不匹配发卡或确认发货规则。
+func (c *Center) handleBargainPending(ctx context.Context, task Task) (bool, error) {
+	if task.Source != "ws" {
+		c.logger.Warn("拒绝非 WebSocket 的免拼阶段任务", "source", task.Source, "account", task.AccountID, "order_id", task.OrderID)
+		return false, nil
+	}
+	// autoBargain、settingsErr 保存独立自动免拼开关和读取错误。
+	autoBargain, settingsErr := c.store.Cookies.GetAutoBargain(ctx, task.AccountID)
+	if settingsErr != nil {
+		return false, fmt.Errorf("读取自动免拼设置: %w", settingsErr)
+	}
+	if !autoBargain {
+		c.logger.Info("账号未启用自动免拼，跳过待刀成阶段", "account", task.AccountID, "order_id", task.OrderID)
+		return false, nil
+	}
+	if task.OrderID == "" {
+		return false, fmt.Errorf("免拼阶段缺少订单ID")
+	}
+	// claimed、claimErr 保存本次 WS 是否取得免拼阶段唯一执行权。
+	claimed, claimErr := c.store.Automation.ClaimBargainFreeShipping(ctx, task.OrderID, task.AccountID)
+	if claimErr != nil {
+		return false, fmt.Errorf("领取免拼阶段执行权: %w", claimErr)
+	}
+	if !claimed {
+		c.logger.Info("免拼阶段已有其他任务处理，跳过重复事件", "account", task.AccountID, "order_id", task.OrderID)
+		return false, nil
+	}
+	c.logger.Info("开始执行自动免拼", "account", task.AccountID, "order_id", task.OrderID, "trigger", task.TriggerType)
+	// actionErr 保存独立免拼接口的执行结果。
+	actionErr := c.actions.freeShipBargain(ctx, task)
+	// status 保存可重试的明确失败、需要人工核对的未知结果或成功终态。
+	status := "succeeded"
+	if actionErr != nil {
+		// uncertain 用于识别可能已被平台执行、因而不能自动再次提交的免拼结果。
+		var uncertain *uncertainActionError
+		if errors.As(actionErr, &uncertain) {
+			status = "needs_review"
+		} else {
+			status = "failed"
+		}
+		c.logger.Warn("自动免拼失败，已保存阶段状态", "account", task.AccountID, "order_id", task.OrderID, "status", status, "err", actionErr)
+	} else {
+		c.logger.Info("自动免拼成功，等待成功小刀消息后发卡", "account", task.AccountID, "order_id", task.OrderID)
+	}
+	// finishErr 保存免拼阶段终态写入错误，避免远端成功后丢失兜底资格。
+	if finishErr := c.store.Automation.FinishBargainFreeShipping(ctx, task.OrderID, task.AccountID, status); finishErr != nil {
+		// reviewReason 说明阶段收口失败后为何不能再次自动免拼。
+		reviewReason := "免拼请求已经执行，但本地阶段状态保存失败，禁止自动重试，请核对平台订单状态：" + finishErr.Error()
+		if actionErr != nil {
+			reviewReason = "免拼请求结果和本地阶段状态均无法确认，禁止自动重试，请核对平台订单状态：" + errors.Join(actionErr, finishErr).Error()
+		}
+		// notifyCtx 保证原始请求取消后，人工处理通知仍有独立的短时入队预算。
+		notifyCtx, notifyCancel := newAutomationRunCompensationContext(ctx)
+		c.notifications.notifyManualIntervention(notifyCtx, task, "二人小刀免拼", reviewReason, bargainManualInterventionKey(task))
+		notifyCancel()
+		if actionErr != nil {
+			return false, errors.Join(actionErr, fmt.Errorf("收口免拼阶段: %w", finishErr))
+		}
+		return false, uncertainAction(fmt.Errorf("闲鱼已免拼，但本地阶段保存失败: %w", finishErr))
+	}
+	if status == "needs_review" {
+		// notifyCtx 保证免拼结果不确定时的人工处理通知不受平台调用上下文取消影响。
+		notifyCtx, notifyCancel := newAutomationRunCompensationContext(ctx)
+		c.notifications.notifyManualIntervention(notifyCtx, task, "二人小刀免拼", actionErr.Error(), bargainManualInterventionKey(task))
+		notifyCancel()
+	}
+	return false, actionErr
+}
+
+// bargainManualInterventionKey 返回同一账号、订单、免拼阶段共享的通知幂等键，重复 WS 不会制造重复告警。
+func bargainManualInterventionKey(task Task) string {
+	return fmt.Sprintf("manual-intervention:bargain-free-shipping:%s:%s", task.AccountID, task.OrderID)
+}
+
 // taskAutomationRunID 封装任务自动化运行ID业务协调。
 func taskAutomationRunID(task Task) int64 {
 	if task.Raw == nil {
@@ -354,6 +503,19 @@ func taskAutomationRunID(task Task) int64 {
 	// id 用于本次流程后续判断的标识
 	id, _ := strconv.ParseInt(value, 10, 64)
 	return id
+}
+
+// paidDeliveryAutoConfirmEnabled 返回账号是否开启「自动确认发货」。
+// 兜底扫描必须在重开运行或领取冷却窗口之前检查它：开关关闭时 HandleTask 会直接返回而不收口运行，
+// 被它重开的运行会留在 running 并继续持有租约；租约到期后失败运行恢复链路直接执行 executeRule，
+// 从而绕过账号开关与自动确认设置。
+func (c *Center) paidDeliveryAutoConfirmEnabled(ctx context.Context, accountID string) (bool, error) {
+	// autoConfirm、err 保存账号自动确认发货开关与读取错误。
+	autoConfirm, err := c.store.Cookies.GetAutoConfirm(ctx, accountID)
+	if err != nil {
+		return false, fmt.Errorf("读取自动确认发货设置: %w", err)
+	}
+	return autoConfirm, nil
 }
 
 // taskDelayCursor 封装任务延迟游标业务协调。
@@ -398,157 +560,6 @@ func (c *Center) deferTaskWithError(ctx context.Context, task Task, dueAt int64,
 		TaskKey: task.AccountID + ":" + key, CookieID: task.AccountID,
 		TriggerType: task.TriggerType, TaskJSON: string(raw), DueAt: dueAt, ErrorMessage: errMsg,
 	})
-}
-
-// ManualFullDelivery 对已存在订单执行完整发货，和付款系统事件共用同一套
-// 订单详情补全、规格匹配、按购买数量发卡、确认发货逻辑。
-// ManualFullDelivery 封装ManualFull发货业务协调。
-func (c *Center) ManualFullDelivery(ctx context.Context, order *db.Order) (int, error) {
-	if c == nil || c.store == nil || order == nil {
-		return 0, fmt.Errorf("自动化中心未初始化或订单为空")
-	}
-	if strings.TrimSpace(order.OrderID) == "" {
-		return 0, fmt.Errorf("订单缺少订单ID")
-	}
-	// paused、until、err 用于本次流程后续判断的paused、until、err
-	paused, until, err := c.store.Cookies.IsPaused(ctx, order.CookieID)
-	if err != nil {
-		return 0, fmt.Errorf("读取账号暂停状态: %w", err)
-	}
-	if paused {
-		return 0, fmt.Errorf("账号暂停处理中，恢复时间 %d", until)
-	}
-	// enabled、err 用于本次流程后续判断的enabled、err
-	enabled, err := c.store.Cookies.Status(ctx, order.CookieID)
-	if err != nil {
-		return 0, fmt.Errorf("读取账号启用状态: %w", err)
-	}
-	if !enabled {
-		return 0, fmt.Errorf("账号已停用，无法执行完整发货")
-	}
-	if strings.TrimSpace(order.CookieID) == "" {
-		return 0, fmt.Errorf("订单缺少账号ID")
-	}
-	if strings.TrimSpace(order.ItemID) == "" {
-		return 0, fmt.Errorf("订单缺少商品ID，无法匹配自动化规则")
-	}
-	if strings.TrimSpace(order.ChatID) == "" || strings.TrimSpace(order.BuyerID) == "" {
-		return 0, fmt.Errorf("订单缺少 chat_id 或 buyer_id，无法发送卡券")
-	}
-	// task 用于本次流程后续判断的任务
-	task := Task{
-		Source:               "manual",
-		AccountID:            order.CookieID,
-		TriggerType:          TriggerOrderPaid,
-		ChatID:               order.ChatID,
-		OrderID:              order.OrderID,
-		ItemID:               order.ItemID,
-		BuyerID:              order.BuyerID,
-		SpecName:             order.SpecName,
-		SpecValue:            order.SpecValue,
-		Quantity:             order.Quantity,
-		Amount:               order.Amount,
-		OrderStatus:          order.OrderStatus,
-		ForceConfirmShipment: true,
-		Raw:                  map[string]any{"manual": true},
-	}
-	task, err = c.prepareTask(ctx, task)
-	if err != nil {
-		return 0, err
-	}
-	// rules、err 用于本次流程后续判断的rules、err
-	rules, err := c.rules.match(ctx, task)
-	if err != nil {
-		return 0, err
-	}
-	if len(rules) == 0 {
-		return 0, fmt.Errorf("未匹配到付款后自动发货规则")
-	}
-	// sent 用于本次流程后续判断的sent
-	sent := 0
-	// rule 表示当前遍历过程中的规则
-	for _, rule := range rules {
-		if !c.planner.hasMatchingSendCard(task, rule.Actions) {
-			continue
-		}
-		task.ActionPlan = c.planner.plan(task, c.planner.immediateManualActions(rule.Actions))
-		// rawTask 用于本次流程后续判断的原始任务
-		rawTask := task
-		rawTask.CookieStr = ""
-		// rawJSON 保存原始JSON，供恢复运行读取；marshalErr 表示快照序列化失败，失败时不能继续执行不可逆动作。
-		rawJSON, marshalErr := json.Marshal(rawTask)
-		if marshalErr != nil {
-			return 0, fmt.Errorf("保存完整发货运行快照: %w", marshalErr)
-		}
-		// runID、started、startErr 用于本次流程后续判断的运行ID、started、startErr
-		runID, started, startErr := c.store.Automation.TryStartRun(ctx, db.AutomationRun{
-			RuleID:         rule.ID,
-			CookieID:       task.AccountID,
-			ItemID:         task.ItemID,
-			OrderID:        task.OrderID,
-			BuyerID:        task.BuyerID,
-			ChatID:         task.ChatID,
-			TriggerType:    TriggerOrderPaid,
-			TriggerKey:     buildTriggerKey(task),
-			RawEventJSON:   string(rawJSON),
-			LeaseExpiresAt: time.Now().UTC().Add(5 * time.Minute).Unix(),
-		})
-		if startErr != nil {
-			return 0, startErr
-		}
-		if !started {
-			return 0, fmt.Errorf("该订单已自动或手动执行过完整发货；如仅需补记状态，请选择仅修改发货状态")
-		}
-		// run、getErr 用于本次流程后续判断的run、getErr
-		run, getErr := c.store.Automation.GetRun(ctx, runID)
-		if getErr != nil {
-			return 0, getErr
-		}
-		// n、deferred、err 用于本次流程后续判断的n、deferred、err
-		n, deferred, err := c.executeRunActions(ctx, task, rule.ID, run, task.ActionPlan, true)
-		if deferred {
-			return n, errors.New("手动完整发货不应进入延迟队列")
-		}
-		sent = n
-		if errors.Is(err, errAutomationNeedsReview) {
-			return sent, err
-		}
-		// status、errMsg 用于本次流程后续判断的status、errMsg
-		status, errMsg := "success", ""
-		if err != nil {
-			status, errMsg = "failed", err.Error()
-		}
-		// finishCtx、cancel 用于本次流程后续判断的finishCtx、cancel
-		finishCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		// finishErr 用于本次流程后续判断的finishErr
-		finishErr := c.store.Automation.FinishRun(finishCtx, runID, run.AttemptCount, status, sent, errMsg)
-		if finishErr != nil {
-			// reason 说明外部动作已经可能执行，但运行结果未能收口，必须禁止自动重放并转人工核对。
-			reason := "完整发货外部动作可能已执行，但运行结果保存失败，已停止自动重放，请人工核对: " + finishErr.Error()
-			// quarantineErr 保存把手动运行转为人工核对状态时的错误。
-			quarantineErr := c.store.Automation.QuarantineRunResult(finishCtx, runID, run.AttemptCount, sent, reason)
-			cancel()
-			if quarantineErr != nil {
-				return sent, errors.Join(
-					errAutomationNeedsReview,
-					fmt.Errorf("保存完整发货执行结果: %w", finishErr),
-					fmt.Errorf("保存完整发货人工核对状态: %w", quarantineErr),
-				)
-			}
-			return sent, errors.Join(errAutomationNeedsReview, fmt.Errorf("保存完整发货执行结果: %w", finishErr))
-		}
-		cancel()
-		if err != nil {
-			return sent, err
-		}
-		if n > 0 {
-			break
-		}
-	}
-	if sent == 0 {
-		return 0, fmt.Errorf("未匹配到订单规格对应的卡密动作")
-	}
-	return sent, nil
 }
 
 // executeRule 将规则执行委托给运行协调器，保持 Center 的兼容调用入口。
@@ -763,6 +774,12 @@ func (c *Center) cookieValue(ctx context.Context, cookieID string) (string, erro
 
 // buildTriggerKey 封装buildTriggerKey业务协调。
 func buildTriggerKey(task Task) string {
+	if task.Raw != nil {
+		// marker 是未知角色事件在订单号补齐前生成的稳定防重键；恢复时必须优先沿用它。
+		if marker, ok := task.Raw[roleVerificationTaskKeyField].(string); ok && strings.TrimSpace(marker) != "" {
+			return strings.TrimSpace(marker)
+		}
+	}
 	if task.TriggerType == TriggerReviewMissingTimeout && task.OrderID != "" {
 		if // attempt、ok 用于本次流程后续判断的attempt、ok
 		attempt, ok := task.Raw["attempt"]; ok {

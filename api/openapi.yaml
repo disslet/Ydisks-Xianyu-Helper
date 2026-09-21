@@ -2499,6 +2499,60 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  "/api/v1/chat/items":
+    get:
+      operationId: getApiV1ChatItems
+      summary: 查询个人会话中对方或当前账号的在售商品
+      security: [{cookieAuth: []}]
+      parameters:
+        - name: account_id
+          in: query
+          required: true
+          schema: {type: string}
+        - name: chat_id
+          in: query
+          required: true
+          schema: {type: string}
+        - name: role
+          in: query
+          required: true
+          schema: {type: string, enum: [peer, self]}
+        - name: query
+          in: query
+          required: false
+          schema: {type: string, maxLength: 100}
+        - name: page
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, default: 1}
+      responses:
+        '200': {description: 成功, content: {application/json: {schema: {$ref: '#/components/schemas/ChatItemPage'}}}}
+        '400': {description: 统一错误响应, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '401': {description: 统一错误响应, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: 统一错误响应, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: 统一错误响应, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '502': {description: 闲鱼商品查询失败, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '503': {description: 商品查询能力未装配, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  "/api/v1/chat/item-cards":
+    post:
+      operationId: postApiV1ChatItemCards
+      summary: 向个人会话发送商品卡片
+      security: [{cookieAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ChatItemCardRequest'}
+      responses:
+        '201': {description: 成功, content: {application/json: {schema: {$ref: '#/components/schemas/ChatMessageEnvelope'}}}}
+        '400': {description: 统一错误响应, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '401': {description: 统一错误响应, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: 统一错误响应, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: 统一错误响应, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: 账号离线, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '500': {description: 平台已发送但本地状态收口失败, content: {application/json: {schema: {$ref: '#/components/schemas/ChatSendErrorResponse'}}}}
+        '502': {description: 平台发送失败, content: {application/json: {schema: {$ref: '#/components/schemas/ChatSendErrorResponse'}}}}
+        '503': {description: 商品发送能力未装配, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
   "/api/v1/chat/images":
     post:
       operationId: postApiV1ChatImages
@@ -2510,13 +2564,13 @@ paths:
           multipart/form-data:
             schema:
               type: object
-              required: [account_id, chat_id, buyer_id, image]
+              required: [account_id, chat_id, peer_user_id, image]
               properties:
                 account_id: {type: string}
                 chat_id: {type: string}
-                buyer_id: {type: string}
-                buyer_name: {type: string}
-                buyer_avatar_url: {type: string}
+                peer_user_id: {type: string}
+                peer_name: {type: string}
+                peer_avatar_url: {type: string}
                 item_id: {type: string}
                 item_title: {type: string}
                 image: {type: string, format: binary}
@@ -2848,6 +2902,62 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
   "/api/v1/chat/sessions":
+    delete:
+      operationId: deleteApiV1ChatSessions
+      summary: deleteApiV1ChatSessions
+      security: [{cookieAuth: []}]
+      parameters:
+        - name: account_id
+          in: query
+          required: true
+          schema: {type: string}
+        - name: chat_id
+          in: query
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResponse'
+        '400':
+          description: 统一错误响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: 统一错误响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 统一错误响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 统一错误响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: 统一错误响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: 统一错误响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
     get:
       operationId: getApiV1ChatSessions
       summary: getApiV1ChatSessions
@@ -4397,6 +4507,53 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
   "/api/v1/notifications/channels/{channel_id}":
+    get:
+      operationId: getApiV1NotificationsChannelsBychannel_id
+      summary: getApiV1NotificationsChannelsBychannel_id
+      parameters:
+          - name: channel_id
+            in: path
+            required: true
+            schema:
+              type: string
+      security: [{cookieAuth: []}]
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationChannelEditorResponse'
+        '400':
+          description: 统一错误响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: 统一错误响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 统一错误响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 统一错误响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: 统一错误响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
     delete:
       operationId: deleteApiV1NotificationsChannelsBychannel_id
       summary: deleteApiV1NotificationsChannelsBychannel_id
@@ -4987,54 +5144,26 @@ paths:
   "/api/v1/orders/import":
     post:
       operationId: postApiV1OrdersImport
-      summary: postApiV1OrdersImport
+      summary: 人工插入订单已永久移除
+      deprecated: true
+      x-contract-success-exception:
+        kind: permanently_disabled
       security: [{cookieAuth: []}]
-      requestBody:
-        required: true
-        content:
-          multipart/form-data:
-            schema:
-              type: object
-              properties:
-                file: {type: string, format: binary}
-          application/json:
-            schema:
-              type: array
-              items:
-                $ref: '#/components/schemas/OrderUpdateRequest'
       responses:
-        '200':
-          description: 成功
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/OrderBatchResponse'
         '400':
           description: 统一错误响应
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          description: 人工插入订单已移除，请使用订单同步
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '401':
-          description: 统一错误响应
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '403':
-          description: 统一错误响应
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '404':
-          description: 统一错误响应
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '500':
-          description: 统一错误响应
+          description: 未登录
           content:
             application/json:
               schema:
@@ -5780,6 +5909,12 @@ paths:
             schema:
               type: string
       security: [{cookieAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KeywordCreateRequest'
       responses:
         '200':
           description: 成功
@@ -5933,6 +6068,12 @@ paths:
             schema:
               type: string
       security: [{cookieAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KeywordCreateRequest'
       responses:
         '200':
           description: 成功
@@ -6495,6 +6636,60 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '500':
           description: 统一错误响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  "/api/v1/settings/ai-test":
+    post:
+      operationId: postApiV1SettingsAiTest
+      summary: postApiV1SettingsAiTest
+      security: [{cookieAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AIConnectionTestRequest'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AIConnectionTestResponse'
+        '400':
+          description: 统一错误响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: 统一错误响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 统一错误响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 统一错误响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: 统一错误响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '502':
+          description: AI 上游服务或连接测试失败的统一错误响应
           content:
             application/json:
               schema:
@@ -7167,7 +7362,7 @@ components:
         trigger_type: {type: string}
         enabled: {type: boolean}
         priority: {type: integer}
-        config_json: {type: string}
+        config_json: {type: string, description: '规则 JSON 配置；账号级 order_paid 仅在 allow_all_items 为布尔 true 时允许全商品兜底，省略或 false 均不授权。'}
         actions: {type: array, items: {$ref: '#/components/schemas/AutomationActionRequest'}}
     AutomationActionResponse:
       type: object
@@ -7200,7 +7395,7 @@ components:
         trigger_type: {type: string}
         enabled: {type: boolean}
         priority: {type: integer}
-        config_json: {type: string}
+        config_json: {type: string, description: '规则 JSON 配置；账号级 order_paid 仅在 allow_all_items 为布尔 true 时允许全商品兜底，省略或 false 均不授权。'}
         sku_migration_status: {type: string, enum: [pending, ready, needs_reconfiguration]}
         actions: {type: array, items: {$ref: '#/components/schemas/AutomationActionResponse'}}
         created_at: {type: string}
@@ -7336,17 +7531,28 @@ components:
       items: {$ref: '#/components/schemas/KeywordItemResponse'}
     KeywordTypedResponse:
       type: object
-      required: [id, keyword, reply, item_id, type, image_url]
+      required: [id, keyword, reply, item_id, item_ids, type, image_url]
       properties:
         id: {type: integer}
         keyword: {type: string}
         reply: {type: string}
-        item_id: {type: string}
+        item_id: {type: string, description: 关联商品标识的持久化字段；多选时为逗号分隔串，空串表示账号级回复}
+        item_ids: {type: array, items: {type: string}, description: 关联商品标识集合；空集合表示账号级回复}
         type: {type: string}
         image_url: {type: string}
     KeywordTypedListResponse:
       type: array
       items: {$ref: '#/components/schemas/KeywordTypedResponse'}
+    KeywordCreateRequest:
+      type: object
+      required: [keyword, reply, item_id, item_ids, type, image_url]
+      properties:
+        keyword: {type: string}
+        reply: {type: string}
+        item_id: {type: string, description: 兼容旧单值调用方；多选时由 item_ids 合并而来}
+        item_ids: {type: array, items: {type: string}, description: 关联商品标识集合；一条规则可关联多个商品，空集合表示账号级回复}
+        type: {type: string}
+        image_url: {type: string}
     DefaultReplyMapResponse:
       type: object
       additionalProperties:
@@ -7458,8 +7664,18 @@ components:
         postage_mode: {type: string}
         postage: {type: string}
         location: {type: string}
+        category_id: {type: string, description: 可选的闲鱼类目主键}
+        category_name: {type: string, description: 可选的闲鱼类目名称}
+        channel_category_id: {type: string, description: 可选的闲鱼频道类目主键}
+        tb_category_id: {type: string, description: 可选的淘宝类目主键}
+        item_properties: {type: string, description: 可选的闲鱼 itemProperties JSON；多规格时每个维度至少包含两个规格值}
+        item_sku_list: {type: string, description: 可选的闲鱼 itemSkuList JSON；多规格时逐行提供价格、库存和 propertyList}
         images:
           type: array
+          items: {type: string, format: binary}
+        spec_images:
+          type: array
+          description: 多规格规格值图片，可选
           items: {type: string, format: binary}
     ItemPublishBatchPreviewRow:
       type: object
@@ -7755,6 +7971,17 @@ components:
         event_types: {type: string}
         enabled: {type: boolean}
         user_id: {type: integer}
+    NotificationChannelEditorResponse:
+      type: object
+      required: [id, name, type, enabled]
+      properties:
+        id: {type: integer}
+        name: {type: string}
+        type: {type: string}
+        event_types: {type: string}
+        enabled: {type: boolean}
+        to_email: {type: string}
+        use_custom_smtp: {type: boolean}
     NotificationChannelCreateRequest:
       type: object
       required: [name, type]
@@ -7770,6 +7997,10 @@ components:
         name: {type: string}
         type: {type: string}
         config: {type: string}
+        email_recipient:
+          type: string
+          minLength: 1
+          description: 仅更新已有邮件渠道的收件地址，保留所有 SMTP 配置；与 config 互斥，不可同时改变渠道类型。
         event_types: {type: string}
         enabled: {type: boolean}
     NotificationBindingRequest:
@@ -7900,7 +8131,7 @@ components:
           type: string
     AccountDetailResponse:
       type: object
-      required: [id, has_cookie, enabled, auto_confirm, remark, pause_duration, paused_until, paused, show_browser, username, nickname, avatar_url, login_method, last_login_at, profile_error, auto_rate_enabled, rate_content, auto_polish_enabled, polish_time, last_rate_scan_at, last_polish_date, last_polish_at]
+      required: [id, has_cookie, enabled, auto_confirm, auto_consign, auto_bargain, remark, pause_duration, paused_until, paused, show_browser, username, nickname, avatar_url, login_method, last_login_at, profile_error, auto_rate_enabled, rate_content, auto_polish_enabled, polish_time, last_rate_scan_at, last_polish_date, last_polish_at]
       properties:
         id:
           type: string
@@ -7909,6 +8140,10 @@ components:
         enabled:
           type: boolean
         auto_confirm:
+          type: boolean
+        auto_consign:
+          type: boolean
+        auto_bargain:
           type: boolean
         remark:
           type: string
@@ -7965,6 +8200,10 @@ components:
           type: string
         auto_confirm:
           type: boolean
+        auto_consign:
+          type: boolean
+        auto_bargain:
+          type: boolean
         pause_duration:
           type: integer
           minimum: 0
@@ -8012,11 +8251,16 @@ components:
       properties:
         auto_confirm:
           type: boolean
+        auto_consign:
+          type: boolean
+          description: 自动发货后是否自动确认发货（转已发货）；省略时保持不变
     AutoConfirmResponse:
       type: object
-      required: [auto_confirm]
+      required: [auto_confirm, auto_consign]
       properties:
         auto_confirm:
+          type: boolean
+        auto_consign:
           type: boolean
     AccountRemarkRequest:
       type: object
@@ -8103,6 +8347,28 @@ components:
           type: array
           items:
             type: string
+    AIConnectionTestRequest:
+      type: object
+      required: [base_url]
+      properties:
+        base_url:
+          type: string
+        api_key:
+          type: string
+        model:
+          type: string
+    AIConnectionTestResponse:
+      type: object
+      required: [success, model, latency_ms, reply]
+      properties:
+        success:
+          type: boolean
+        model:
+          type: string
+        latency_ms:
+          type: integer
+        reply:
+          type: string
     SecretSettingChange:
       type: object
       required: [action]
@@ -8146,13 +8412,18 @@ components:
           - type: boolean
     ChatSession:
       type: object
-      required: [account_id, chat_id, buyer_id, buyer_name, last_message, last_message_at, unread_count]
+      required: [account_id, chat_id, peer_user_id, peer_name, account_role, buyer_user_id, seller_user_id, role_item_id, role_source, last_message, last_message_at, unread_count]
       properties:
         account_id: {type: string}
         chat_id: {type: string}
-        buyer_id: {type: string}
-        buyer_name: {type: string}
-        buyer_avatar_url: {type: string}
+        peer_user_id: {type: string}
+        peer_name: {type: string}
+        peer_avatar_url: {type: string}
+        account_role: {type: string, enum: [seller, buyer, unknown]}
+        buyer_user_id: {type: string}
+        seller_user_id: {type: string}
+        role_item_id: {type: string}
+        role_source: {type: string}
         item_id: {type: string}
         item_title: {type: string}
         item_image_url: {type: string}
@@ -8170,10 +8441,10 @@ components:
         direction: {type: string, enum: [incoming, outgoing]}
         sender_id: {type: string}
         sender_name: {type: string}
-        message_type: {type: string, enum: [text, image, video, audio, system]}
+        message_type: {type: string, enum: [text, image, video, audio, item, system]}
         content: {type: string}
         media_duration: {type: integer}
-        status: {type: string, enum: [received, sending, sent, failed]}
+        status: {type: string, enum: [received, sending, sent, failed, uncertain]}
         read_status: {type: integer}
         read_at: {type: integer}
         sent_at: {type: integer}
@@ -8231,15 +8502,46 @@ components:
         - $ref: '#/components/schemas/ChatEvent'
     ChatMessageRequest:
       type: object
-      required: [account_id, chat_id, buyer_id, text]
+      required: [account_id, chat_id, peer_user_id, text]
       properties:
         account_id: {type: string}
         chat_id: {type: string}
-        buyer_id: {type: string}
-        buyer_name: {type: string}
+        peer_user_id: {type: string}
+        peer_name: {type: string}
         item_id: {type: string}
         item_title: {type: string}
         text: {type: string, maxLength: 2000}
+    ChatItem:
+      type: object
+      required: [item_id, title, image_url, price]
+      properties:
+        item_id: {type: string, minLength: 1, maxLength: 128}
+        title: {type: string, minLength: 1, maxLength: 200}
+        image_url: {type: string, format: uri, maxLength: 2048}
+        price: {type: string, minLength: 1, maxLength: 64}
+        description: {type: string}
+    ChatItemPage:
+      type: object
+      required: [items, page, has_more]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/ChatItem'}}
+        page: {type: integer, minimum: 1}
+        has_more: {type: boolean}
+    ChatItemCardRequest:
+      type: object
+      required: [account_id, chat_id, item]
+      properties:
+        account_id: {type: string}
+        chat_id: {type: string}
+        item: {$ref: '#/components/schemas/ChatItemCardSnapshot'}
+    ChatItemCardSnapshot:
+      type: object
+      required: [item_id, title, image_url, price]
+      properties:
+        item_id: {type: string, minLength: 1, maxLength: 128}
+        title: {type: string, minLength: 1, maxLength: 200}
+        image_url: {type: string, maxLength: 2048}
+        price: {type: string, minLength: 1, maxLength: 64}
     ChatReadRequest:
       type: object
       required: [account_id, chat_id]
@@ -8380,6 +8682,14 @@ components:
       type: object
       required: [discovered, list_updated, soft_deleted, detail_total, total, updated, no_change, failed]
       properties:
+        restored:
+          type: integer
+          minimum: 0
+          description: 同账号软删除订单恢复数，与新增和错绑修正不重复计数；旧任务可省略。
+        reassigned:
+          type: integer
+          minimum: 0
+          description: 经身份核验修正历史错绑的订单数，与同账号恢复不重复计数；旧任务可省略。
         discovered: {type: integer}
         list_updated: {type: integer}
         soft_deleted: {type: integer}

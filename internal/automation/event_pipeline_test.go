@@ -53,6 +53,57 @@ func TestActionPlannerMultiSKUSelectsOnlyExactCombination(t *testing.T) {
 	}
 }
 
+// TestActionPlannerAccountWideRuleMatchesAnyOrderSpec 验证已确认的账号级付款规则能匹配带规格订单，而未授权任务仍拒绝空规格通配。
+func TestActionPlannerAccountWideRuleMatchesAnyOrderSpec(t *testing.T) {
+	// actions 保存账号级规则的空规格发卡动作和确认发货动作。
+	actions := []db.AutomationAction{
+		{ID: 1, ActionType: ActionSendCard, Enabled: true, ConfigJSON: `{}`},
+		{ID: 2, ActionType: ActionConfirmShipment, Enabled: true},
+	}
+	// allowedTask 表示用户已明确确认适用于全部商品的账号级付款任务。
+	allowedTask := Task{TriggerType: TriggerOrderPaid, SpecName: "套餐", SpecValue: "90天", AllowAllItems: true}
+	// allowedPlan 保存授权任务生成的动作计划。
+	allowedPlan := (actionPlanner{}).plan(allowedTask, actions)
+	// got 保存授权动作计划中的动作顺序，确认发卡位于确认发货之前。
+	if got := []int64{allowedPlan[0].ID, allowedPlan[1].ID}; !reflect.DeepEqual(got, []int64{1, 2}) {
+		t.Fatalf("账号级全商品动作计划=%v want [1 2]", got)
+	}
+	// restrictedTask 表示没有全商品授权的商品级任务，空规格动作不得覆盖带规格订单。
+	restrictedTask := allowedTask
+	restrictedTask.AllowAllItems = false
+	// plan 保存未授权任务过滤规格后的动作计划。
+	if plan := (actionPlanner{}).plan(restrictedTask, actions); len(plan) != 1 || plan[0].ID != 2 {
+		t.Fatalf("未授权空规格动作不应匹配带规格订单: %+v", plan)
+	}
+}
+
+// TestRuleAllowsAllItemsRequiresExplicitAccountPaidConfirmation 验证全商品通配只接受账号级付款规则中的布尔 true。
+func TestRuleAllowsAllItemsRequiresExplicitAccountPaidConfirmation(t *testing.T) {
+	// cases 覆盖商品级、非付款、缺失授权和明确授权四种规则范围。
+	cases := []struct {
+		// name 是当前规则范围场景名称。
+		name string
+		// rule 保存待判断的自动化规则。
+		rule db.AutomationRule
+		// want 表示是否应允许空规格匹配任意订单规格。
+		want bool
+	}{
+		{name: "item rule", rule: db.AutomationRule{ItemID: "item-1", TriggerType: TriggerOrderPaid, ConfigJSON: `{"allow_all_items":true}`}},
+		{name: "review rule", rule: db.AutomationRule{TriggerType: TriggerBuyerReviewed, ConfigJSON: `{"allow_all_items":true}`}},
+		{name: "missing confirmation", rule: db.AutomationRule{TriggerType: TriggerOrderPaid, ConfigJSON: `{}`}},
+		{name: "confirmed account rule", rule: db.AutomationRule{TriggerType: TriggerOrderPaid, ConfigJSON: `{"allow_all_items":true}`}, want: true},
+	}
+	// tc 表示当前待验证的规则范围案例。
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// got 表示当前规则是否通过全商品授权门禁。
+			if got := ruleAllowsAllItems(tc.rule, TriggerOrderPaid); got != tc.want {
+				t.Fatalf("ruleAllowsAllItems=%v want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestEventFactRecorderWithoutOrderIsNoOp 验证没有订单事实时记录组件不执行任何持久化动作。
 func TestEventFactRecorderWithoutOrderIsNoOp(t *testing.T) {
 	// recorder 未注入数据库时应对无订单任务安全忽略。
@@ -63,8 +114,8 @@ func TestEventFactRecorderWithoutOrderIsNoOp(t *testing.T) {
 	}
 }
 
-// TestEventFactRecorderPersistsPaidAndReviewedFacts 验证付款与评价事件会写入订单事实及对应事件时间。
-func TestEventFactRecorderPersistsPaidAndReviewedFacts(t *testing.T) {
+// TestEventFactRecorderPersistsPaidCompletedAndReviewedFacts 验证付款、确认收货与买家评价事件分别写入正确的订单事实和时间。
+func TestEventFactRecorderPersistsPaidCompletedAndReviewedFacts(t *testing.T) {
 	// ctx 保存本地数据库测试共用的上下文。
 	ctx := context.Background()
 	// database、dialect、openErr 保存内存隔离数据库的打开结果。
@@ -91,13 +142,40 @@ func TestEventFactRecorderPersistsPaidAndReviewedFacts(t *testing.T) {
 	}
 	// recorder 保存使用本地数据库的事件事实记录组件。
 	recorder := newEventFactRecorder(store)
+	// bargain 保存订单列表已经确认的砍价事实；后续普通事件不得把它降级为 false。
+	bargain := true
+	// bargainSeedErr 保存砍价订单初始事实写入错误。
+	bargainSeedErr := store.Orders.Upsert(ctx, "order-bargain-preserved", db.OrderUpsertOpts{CookieID: "account-1", ItemID: "item-bargain", OrderStatus: "pending_ship", IsBargain: &bargain})
+	if bargainSeedErr != nil {
+		t.Fatal(bargainSeedErr)
+	}
+	// plainCompletedErr 保存不携带砍价标记的普通完成事件写入错误。
+	plainCompletedErr := recorder.record(ctx, Task{AccountID: "account-1", OrderID: "order-bargain-preserved", TriggerType: TriggerOrderCompleted, OrderStatus: "completed"})
+	if plainCompletedErr != nil {
+		t.Fatalf("普通完成事件写入失败: %v", plainCompletedErr)
+	}
+	// preservedBargainOrder、preservedBargainReadErr 保存普通事件写入后的砍价保护标记。
+	preservedBargainOrder, preservedBargainReadErr := store.Orders.Get(ctx, "order-bargain-preserved")
+	if preservedBargainReadErr != nil || preservedBargainOrder.IsBargain != 1 {
+		t.Fatalf("普通事件不得清除既有砍价事实 order=%+v err=%v", preservedBargainOrder, preservedBargainReadErr)
+	}
 	// paidErr 保存付款事件事实写入错误。
 	paidErr := recorder.record(ctx, Task{AccountID: "account-1", OrderID: "order-paid", ItemID: "item-1", BuyerID: "buyer-1", ChatID: "chat-1", TriggerType: TriggerOrderPaid, OrderStatus: "paid", Quantity: "1", Amount: "2.00"})
 	if paidErr != nil {
 		t.Fatalf("付款事实写入失败: %v", paidErr)
 	}
+	// completedErr 保存买家确认收货事件事实写入错误；该事件负责把订单推进到已完成。
+	completedErr := recorder.record(ctx, Task{AccountID: "account-1", OrderID: "order-completed", ItemID: "item-2", BuyerID: "buyer-2", ChatID: "chat-2", TriggerType: TriggerOrderCompleted, OrderStatus: "completed", Quantity: "1", Amount: "3.00"})
+	if completedErr != nil {
+		t.Fatalf("确认收货事实写入失败: %v", completedErr)
+	}
+	// completedSeedErr 保存买家评价前“已完成”订单写入错误，验证评价事件不会重复推进订单阶段。
+	completedSeedErr := store.Orders.Upsert(ctx, "order-reviewed", db.OrderUpsertOpts{CookieID: "account-1", OrderStatus: "completed"})
+	if completedSeedErr != nil {
+		t.Fatalf("写入已完成订单失败: %v", completedSeedErr)
+	}
 	// reviewedErr 保存评价事件事实写入错误。
-	reviewedErr := recorder.record(ctx, Task{AccountID: "account-1", OrderID: "order-reviewed", ItemID: "item-2", BuyerID: "buyer-2", ChatID: "chat-2", TriggerType: TriggerBuyerReviewed, OrderStatus: "reviewed", Quantity: "1", Amount: "3.00"})
+	reviewedErr := recorder.record(ctx, Task{AccountID: "account-1", OrderID: "order-reviewed", ItemID: "item-2", BuyerID: "buyer-2", ChatID: "chat-2", TriggerType: TriggerBuyerReviewed, Quantity: "1", Amount: "3.00"})
 	if reviewedErr != nil {
 		t.Fatalf("评价事实写入失败: %v", reviewedErr)
 	}
@@ -106,9 +184,14 @@ func TestEventFactRecorderPersistsPaidAndReviewedFacts(t *testing.T) {
 	if paidReadErr != nil || paidOrder.PaidAt == "" {
 		t.Fatalf("付款订单事实异常 order=%+v err=%v", paidOrder, paidReadErr)
 	}
+	// completedOrder、completedReadErr 保存确认收货订单读取结果。
+	completedOrder, completedReadErr := store.Orders.Get(ctx, "order-completed")
+	if completedReadErr != nil || completedOrder.OrderStatus != "completed" || completedOrder.CompletedAt == "" {
+		t.Fatalf("确认收货订单事实异常 order=%+v err=%v", completedOrder, completedReadErr)
+	}
 	// reviewedOrder、reviewedReadErr 保存评价订单读取结果。
 	reviewedOrder, reviewedReadErr := store.Orders.Get(ctx, "order-reviewed")
-	if reviewedReadErr != nil || reviewedOrder.BuyerReviewedAt == "" {
+	if reviewedReadErr != nil || reviewedOrder.OrderStatus != "completed" || reviewedOrder.BuyerReviewedAt == "" {
 		t.Fatalf("评价订单事实异常 order=%+v err=%v", reviewedOrder, reviewedReadErr)
 	}
 	// paidSeedErr 保存付款事件错误分支预置订单的写入错误。

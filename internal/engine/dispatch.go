@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -160,6 +161,10 @@ func extractMessageID(decrypted map[string]any) string {
 	if id := strings.TrimSpace(toString(m1["3"])); id != "" && id != "<nil>" {
 		return id
 	}
+	// platformID 在协议字段变体下寻找消息模型返回的 PNM，避免实时最新消息退回关联 UUID。
+	if platformID := findPNMMessageID(decrypted); platformID != "" {
+		return platformID
+	}
 	// m10、ok 保存消息展示扩展及其是否存在，用于兼容旧消息关联 ID。
 	m10, ok := m1["10"].(map[string]any)
 	if !ok {
@@ -190,6 +195,76 @@ func extractMessageID(decrypted map[string]any) string {
 		}
 	}
 	return findMessageID(decrypted)
+}
+
+// findPNMMessageID 递归寻找闲鱼消息模型使用的 PNM 标识。
+func findPNMMessageID(value any) string {
+	// current 是当前递归层待检查的协议值。
+	switch current := value.(type) {
+	case map[string]any:
+		// keys 按协议语义优先级和字典序排列，避免 map 随机遍历决定消息归属。
+		keys := orderedMessageKeys(current)
+		// key 是按协议优先级选出的当前字段名。
+		for _, key := range keys {
+			// child 是当前字段对应的嵌套值。
+			child := current[key]
+			// id 是子值递归解析得到的消息模型标识。
+			if id := findPNMMessageID(child); id != "" {
+				return id
+			}
+		}
+	case []any:
+		// child 是当前数组元素的嵌套协议值。
+		for _, child := range current {
+			// id 是数组元素递归解析得到的消息模型标识。
+			if id := findPNMMessageID(child); id != "" {
+				return id
+			}
+		}
+	case string:
+		// id 是当前字符串去除空白后的候选消息模型标识。
+		id := strings.TrimSpace(current)
+		if strings.HasSuffix(id, ".PNM") {
+			return id
+		}
+		// decoded 兼容平台把消息模型嵌在 JSON 字符串中的实时帧格式。
+		var decoded any
+		if json.Unmarshal([]byte(current), &decoded) == nil {
+			return findPNMMessageID(decoded)
+		}
+	}
+	return ""
+}
+
+// orderedMessageKeys 返回稳定的消息模型字段顺序；未知字段按字典序作为兼容兜底。
+func orderedMessageKeys(values map[string]any) []string {
+	// priority 是平台消息模型中应优先递归的字段顺序。
+	const priority = "1,message,messageModel,data,body,content,payload,model,10,extJson,bizTag,reminderUrl"
+	// priorityKeys 保存拆分后的优先字段名。
+	priorityKeys := strings.Split(priority, ",")
+	// seen 记录已加入优先顺序的字段，避免未知字段重复加入。
+	seen := make(map[string]struct{}, len(values))
+	// keys 保存最终稳定的字段遍历顺序。
+	keys := make([]string, 0, len(values))
+	// key 是当前优先字段名。
+	for _, key := range priorityKeys {
+		// ok 表示当前字段是否存在于输入消息中。
+		if _, ok := values[key]; ok {
+			keys = append(keys, key)
+			seen[key] = struct{}{}
+		}
+	}
+	// remaining 保存未命中协议优先级、需要按字典序补充的字段名。
+	remaining := make([]string, 0, len(values)-len(keys))
+	// key 是输入消息中的任意字段名。
+	for key := range values {
+		// ok 表示当前字段是否已经被优先顺序收录。
+		if _, ok := seen[key]; !ok {
+			remaining = append(remaining, key)
+		}
+	}
+	sort.Strings(remaining)
+	return append(keys, remaining...)
 }
 
 // findMessageID 递归解析兼容消息信封中可能存在的关联消息 ID。
@@ -314,9 +389,14 @@ func extractOwnWebSocketEcho(decrypted map[string]any, accountID, cookieStr stri
 	if m10 == nil {
 		return nil
 	}
-	// text 保存平台通知层给出的消息摘要；空摘要不创建无内容出站记录。
+	// text 保存平台通知层给出的消息摘要；图片回显可能没有摘要，后续改用媒体正文判断。
 	text, _ := m10["reminderContent"].(string)
-	if text == "" || isNonUserChatNotice(m1, m10, text) {
+	// contentType 保存平台回显的消息类型，用于区分文本和图片的匹配正文。
+	contentType := messageContentType(m1, m10)
+	if text == "" && contentType != "2" {
+		return nil
+	}
+	if text != "" && isNonUserChatNotice(m1, m10, text) {
 		return nil
 	}
 	// senderUserID 保存归一化后的发送者身份，必须与当前账号身份一致才是自身回显。
@@ -339,13 +419,138 @@ func extractOwnWebSocketEcho(decrypted map[string]any, accountID, cookieStr stri
 	reminderURL, _ := m10["reminderUrl"].(string)
 	// buyerID 保存深链中的对端用户标识；它不能等于当前账号，缺失时由既有会话保留原身份。
 	buyerID := extractChatPeerUserID(reminderURL, selfUserID)
-	return &OutgoingChatMessage{
-		AccountID:  accountID,
-		ChatID:     chatID,
-		BuyerID:    buyerID,
-		Text:       text,
-		MessageKey: extractMessageID(decrypted),
+	// messageType 和 content 默认保留文本摘要；图片和商品卡片改为规范媒体正文。
+	messageType, content := "text", text
+	switch contentType {
+	case "2":
+		messageType = "image"
+		content = extractImageObservationContent(decrypted)
+	case "7":
+		// itemContent 是自身跨端回显中归一化后的商品快照 JSON。
+		if itemContent := extractItemCardObservationContent(decrypted); itemContent != "" {
+			messageType, content = "item", itemContent
+		}
 	}
+	return &OutgoingChatMessage{
+		AccountID:   accountID,
+		ChatID:      chatID,
+		BuyerID:     buyerID,
+		Text:        text,
+		MessageKey:  extractMessageID(decrypted),
+		MessageType: messageType,
+		Content:     content,
+	}
+}
+
+// extractImageObservationContent 从自身回显中提取第一张图片 URL，供自动化发送确认使用。
+// value 是已解密但未包含凭证的 WebSocket 消息；解析失败或缺少公网 URL 时返回空值。
+func extractImageObservationContent(value any) string {
+	// imageURL 保存当前回显中首个可比较的图片地址；找到后停止递归，保持消息顺序稳定。
+	var imageURL string
+	// walk 递归展开平台对象、数组和嵌套 JSON 字符串，避免依赖单一客户端版本的固定路径。
+	var walk func(any)
+	walk = func(current any) {
+		if imageURL != "" || current == nil {
+			return
+		}
+		// typed 保存当前节点的具体协议类型，便于继续展开嵌套图片正文。
+		switch typed := current.(type) {
+		case string:
+			// nested 保存可能作为字符串封装的图片消息对象。
+			var nested any
+			if json.Unmarshal([]byte(typed), &nested) == nil {
+				walk(nested)
+			}
+		case map[string]any:
+			// image 保存平台图片消息的对象；pics 保存其中按发送顺序排列的图片数组。
+			// imageFound 表示当前对象是否包含图片正文；picsFound 表示是否找到图片数组。
+			if image, imageFound := typed["image"].(map[string]any); imageFound {
+				// pics、picsFound 保存图片数组及其存在性，避免把非图片节点误当作可确认正文。
+				if pics, picsFound := image["pics"].([]any); picsFound {
+					// picValue 保存图片数组中的单个协议节点，后续只读取其中的 URL 字段。
+					for _, picValue := range pics {
+						// pic 保存当前图片字段；picURL 是其可直接比较的 URL。
+						pic, _ := picValue.(map[string]any)
+						// picURL 保存当前图片的公网地址，用于和发送参数做幂等匹配。
+						picURL := strings.TrimSpace(toString(pic["url"]))
+						if strings.HasPrefix(picURL, "http://") || strings.HasPrefix(picURL, "https://") {
+							imageURL = picURL
+							return
+						}
+					}
+				}
+			}
+			// child 保存当前对象的嵌套字段，继续寻找不同客户端版本的图片路径。
+			for _, child := range typed {
+				walk(child)
+			}
+		case []any:
+			// child 保存数组中的协议节点，按平台原始顺序递归展开。
+			for _, child := range typed {
+				walk(child)
+			}
+		}
+	}
+	walk(value)
+	return imageURL
+}
+
+// extractItemCardObservationContent 从已解密帧中查找 contentType=7 的 itemCard.item 并输出规范 JSON。
+func extractItemCardObservationContent(value any) string {
+	// content 保存首个字段完整的商品卡片正文。
+	var content string
+	// walk 递归穿透平台的 JSON 字符串、对象和数组封装。
+	var walk func(any)
+	walk = func(current any) {
+		if content != "" {
+			return
+		}
+		// typed 是当前递归节点按实际 JSON 类型展开后的值。
+		switch typed := current.(type) {
+		case string:
+			// nested 是可能二次 JSON 编码的内层值。
+			var nested any
+			if json.Unmarshal([]byte(typed), &nested) == nil {
+				walk(nested)
+			}
+		case map[string]any:
+			// itemCard 是官网 contentType=7 的卡片外层对象。
+			itemCard, _ := typed["itemCard"].(map[string]any)
+			// item 是保存商品身份及展示字段的卡片内层对象。
+			item, _ := itemCard["item"].(map[string]any)
+			if item != nil {
+				// itemID 和 title 是渲染商品卡片的必需身份字段。
+				itemID, title := strings.TrimSpace(toString(item["itemId"])), strings.TrimSpace(toString(item["title"]))
+				// imageURL 和 price 是渲染商品卡片的必需展示字段。
+				imageURL, price := strings.TrimSpace(toString(item["mainPic"])), strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(toString(item["price"])), "¥"))
+				if strings.HasPrefix(imageURL, "//") {
+					imageURL = "https:" + imageURL
+				}
+				if itemID != "" && title != "" && imageURL != "" && price != "" {
+					// encoded 是固定字段顺序的非敏感商品 JSON。
+					encoded, marshalErr := json.Marshal(struct {
+						ItemID   string `json:"item_id"`
+						Title    string `json:"title"`
+						ImageURL string `json:"image_url"`
+						Price    string `json:"price"`
+					}{ItemID: itemID, Title: title, ImageURL: imageURL, Price: price})
+					if marshalErr == nil {
+						content = string(encoded)
+						return
+					}
+				}
+			}
+			for _ /* child 是当前对象中继续递归检查的字段值。 */, child := range typed {
+				walk(child)
+			}
+		case []any:
+			for _ /* child 是当前数组中继续递归检查的元素。 */, child := range typed {
+				walk(child)
+			}
+		}
+	}
+	walk(value)
+	return content
 }
 
 // extractChatPeerUserID 从闲鱼聊天深链读取对端用户标识，并拒绝误填为当前账号的值。
@@ -393,6 +598,7 @@ func isSelfUserID(senderUserID, selfUserID string) bool {
 // 典型样本：
 // - contentType=14：“有蚂蚁森林能量可领”“不想宝贝被砍价?设置不砍价回复”“退款成功”
 // - contentType=26：交易卡片，如“我已拍下，待付款”“我发起了退款申请”
+// - contentType=25：确认收货后的评价提醒，如“快给ta一个评价吧～”
 // 付款待发货卡片已经在 handleMessage 前半段进入 automation.Center，这里不能再进入聊天回复链。
 // isNonUserChatNotice 封装isNon用户聊天Notice业务协调。
 func isNonUserChatNotice(m1, m10 map[string]any, reminder string) bool {
@@ -400,6 +606,9 @@ func isNonUserChatNotice(m1, m10 map[string]any, reminder string) bool {
 		return true
 	}
 	if strings.TrimSpace(reminder) == "发来一条新消息" {
+		return true
+	}
+	if strings.TrimSpace(reminder) == "快给ta一个评价吧～" || strings.TrimSpace(reminder) == "快给ta一个评价吧~" {
 		return true
 	}
 	if // sessionType 用于本次流程后续判断的会话类型
@@ -411,7 +620,7 @@ func isNonUserChatNotice(m1, m10 map[string]any, reminder string) bool {
 	switch contentType {
 	case "14":
 		return true
-	case "26":
+	case "25", "26":
 		return true
 	}
 	return false

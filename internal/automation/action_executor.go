@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"xianyu-go/internal/db"
+	"xianyu-go/internal/money"
 	"xianyu-go/internal/orderspec"
 	"xianyu-go/internal/xianyu/cookierefresh"
 	"xianyu-go/internal/xianyu/mtop"
@@ -64,12 +65,25 @@ type shipmentConsignResult struct {
 	callErr error
 }
 
-// shipmentDeliveryProof 保存本次自动发货已经成功投递的文本和图片凭证；它只在当前运行内存中流转，不进入任务快照、日志或通知。
+// shipmentDeliveryProof 保存订单已经确定的发货内容和确认发货凭证。
+// 它最终会加密持久化到自动化运行，供失败后原样重发；不得进入任务快照、日志或通知。
 type shipmentDeliveryProof struct {
 	// tradeText 是已成功发送给买家的文本凭证，多个发货单位按换行合并。
 	tradeText string
 	// picList 是已成功发送给买家的图片地址，顺序与发送顺序一致。
 	picList []string
+	// messages 按原始顺序保存文本和图片消息，重发时必须使用此顺序且不得再次读取卡密库存。
+	messages []db.AutomationDeliveryMessage
+	// expectedUnits 是当前发货动作按计划要求完成的单位数；零表示旧记录无法逐单位恢复。
+	expectedUnits int
+	// preparedUnits 是已经生成并保存内容的确定单位数。
+	preparedUnits int
+	// unknownUnits 是等待人工确认的未知投递单位数。
+	unknownUnits int
+	// refillPending 表示存在已经消费但未能可靠恢复或保存结果的库存单位；为避免重复取卡，后续补发必须先人工核对。
+	refillPending bool
+	// skippedTemplateMessages 保存当前运行中合法跳过的模板消息位置；动作下标由运行协调器补全。
+	skippedTemplateMessages []db.AutomationDeliverySkip
 }
 
 // actionExecutionResult 保存动作成功产生的数量和可供后续确认发货使用的短暂凭证。
@@ -85,6 +99,11 @@ type actionExecutionResult struct {
 // consignWithDeliveryClient 是自动化确认发货需要的可选 MTOP 能力；旧客户端仍可通过无凭证接口兼容运行。
 type consignWithDeliveryClient interface {
 	ConsignContextWithDelivery(context.Context, string, string, string, []string) (bool, []string, string, error)
+}
+
+// freeShippingClient 是砍价订单确认发货所需的可选 MTOP 能力；普通订单继续通过既有虚拟发货接口处理。
+type freeShippingClient interface {
+	FreeShippingContext(context.Context, string, string, string, string) (bool, []string, string, error)
 }
 
 // shipmentCookiePersistence 保存响应 Cookie 的条件写回结果；errors 中的失败需要与远端动作结果一并向调用方报告。
@@ -104,7 +123,8 @@ func (e *automationActionExecutor) executeAction(ctx context.Context, task Task,
 	return result.sent, err
 }
 
-// executeActionWithProof 执行动作并把已发送的发货凭证传递给后续确认发货动作；凭证不跨运行持久化。
+// executeActionWithProof 执行动作并把已发送的发货凭证传递给后续确认发货动作；
+// 运行协调器会把成功内容加密持久化为订单重发快照。
 func (e *automationActionExecutor) executeActionWithProof(ctx context.Context, task Task, action db.AutomationAction, proof shipmentDeliveryProof) (actionExecutionResult, error) {
 	switch action.ActionType {
 	case ActionConfirmShipment:
@@ -129,9 +149,13 @@ func (e *automationActionExecutor) executeActionWithProof(ctx context.Context, t
 			if errors.Is(sendErr, ErrMessageNotSent) {
 				return actionExecutionResult{}, sendErr
 			}
-			return actionExecutionResult{}, uncertainAction(sendErr)
+			// reviewProof 保存传输结果未知时的原始文本，人工补发只能复用它，不能重新渲染可能含卡密的模板。
+			reviewProof := shipmentDeliveryProof{expectedUnits: 1, unknownUnits: 1, messages: []db.AutomationDeliveryMessage{{Kind: "text", Content: text}}}
+			return actionExecutionResult{reviewProof: reviewProof}, uncertainAction(sendErr)
 		}
-		return actionExecutionResult{sent: 1}, nil
+		// proof 保存这条已成功投递的普通文本，人工补发也必须复用同一内容而不能重新渲染动态卡密。
+		proof := shipmentDeliveryProof{expectedUnits: 1, preparedUnits: 1, messages: []db.AutomationDeliveryMessage{{Kind: "text", Content: text}}}
+		return actionExecutionResult{sent: 1, proof: proof}, nil
 	default:
 		return actionExecutionResult{}, fmt.Errorf("未知自动化动作: %s", action.ActionType)
 	}
@@ -144,11 +168,16 @@ func (e *automationActionExecutor) confirmShipment(ctx context.Context, task Tas
 
 // confirmShipmentWithProof 使用已成功投递的凭证确认订单发货；会话恢复重试沿用同一份短暂凭证。
 func (e *automationActionExecutor) confirmShipmentWithProof(ctx context.Context, task Task, proof shipmentDeliveryProof) error {
+	// executionErr 在平台副作用前拒绝已取消或失去数据库执行权的旧动作。
+	if executionErr := checkRunExecution(ctx); executionErr != nil {
+		return fmt.Errorf("%w: %w", ErrMessageNotSent, executionErr)
+	}
+
 	if task.OrderID == "" {
 		return fmt.Errorf("确认发货缺少订单ID")
 	}
-	// enabled 表示账号是否打开自动确认发货设置；readErr 表示读取该账号设置时的数据库错误。
-	enabled, readErr := e.store.Cookies.GetAutoConfirm(ctx, task.AccountID)
+	// enabled 表示账号是否打开自动确认发货（转已发货）设置；readErr 表示读取该账号设置时的数据库错误。
+	enabled, readErr := e.store.Cookies.GetAutoConsign(ctx, task.AccountID)
 	if readErr != nil {
 		return fmt.Errorf("读取自动确认发货设置: %w", readErr)
 	}
@@ -166,7 +195,7 @@ func (e *automationActionExecutor) confirmShipmentAttempt(ctx context.Context, t
 		return err
 	}
 	// succeeded、returns、updatedCookie、callErr 分别保存 MTOP 的业务成功标记、业务返回、扁平 Cookie 更新和调用错误。
-	// client 保存当前确认发货使用的平台客户端；带凭证能力只由新实现提供，旧实现继续发送空凭证。
+	// client 保存当前普通确认发货使用的平台客户端；砍价订单在最终阶段也必须使用该普通确认发货接口。
 	client := e.mtop()
 	// succeeded 表示平台是否明确确认订单已发货。
 	var succeeded bool
@@ -176,8 +205,8 @@ func (e *automationActionExecutor) confirmShipmentAttempt(ctx context.Context, t
 	var updatedCookie string
 	// callErr 保存确认发货请求或响应解析错误。
 	var callErr error
-	// deliveryClient、ok 保存可选的带发货凭证能力及其是否可用。
-	if deliveryClient, ok := client.(consignWithDeliveryClient); ok {
+	// deliveryClient、supported 保存可选的带发货凭证能力及其是否可用。
+	if deliveryClient, supported := client.(consignWithDeliveryClient); supported {
 		succeeded, returns, updatedCookie, callErr = deliveryClient.ConsignContextWithDelivery(session.requestContext, session.cookieStr, task.OrderID, proof.tradeText, proof.picList)
 	} else {
 		succeeded, returns, updatedCookie, callErr = client.ConsignContext(session.requestContext, session.cookieStr, task.OrderID)
@@ -194,8 +223,10 @@ func (e *automationActionExecutor) confirmShipmentAttempt(ctx context.Context, t
 		sessionErr = errors.New(strings.Join(result.returns, "; "))
 	}
 	if mtop.IsSessionExpiredErr(sessionErr) {
+		// credentialLabel 标识唯一允许调用账号恢复器的 Session 失效；Token 已由 MTOP 内部处理。
+		credentialLabel := "Session"
 		if len(persistenceErrs) > 0 {
-			return errors.Join(fmt.Errorf("确认发货 Session 已失效: %w", sessionErr), errors.Join(persistenceErrs...))
+			return errors.Join(fmt.Errorf("确认发货 %s 已失效: %w", credentialLabel, sessionErr), errors.Join(persistenceErrs...))
 		}
 		// recoverer 是当前生效的凭证恢复器快照，避免一次判断期间被替换两次。
 		recoverer := e.recoverer()
@@ -204,9 +235,9 @@ func (e *automationActionExecutor) confirmShipmentAttempt(ctx context.Context, t
 			return e.confirmShipmentAttempt(ctx, task, proof, false)
 		}
 		if !allowCredentialRecovery {
-			return fmt.Errorf("%w: 确认发货在凭证恢复后仍返回 Session 失效: %v", errActionNotPerformed, sessionErr)
+			return fmt.Errorf("%w: 确认发货在凭证恢复后仍返回 %s 失效: %v", errActionNotPerformed, credentialLabel, sessionErr)
 		}
-		return fmt.Errorf("%w: 确认发货 Session 已失效且凭证恢复失败: %v", errActionNotPerformed, sessionErr)
+		return fmt.Errorf("%w: 确认发货 %s 已失效且凭证恢复失败: %v", errActionNotPerformed, credentialLabel, sessionErr)
 	}
 	if result.callErr != nil {
 		if len(persistenceErrs) > 0 {
@@ -259,7 +290,7 @@ func (e *automationActionExecutor) adjustOrderPrice(ctx context.Context, task Ta
 	return 1, nil
 }
 
-// adjustOrderPriceWithRetry 为规则改价和 AI 报价共用平台暂忙重试；传输结果未知和明确业务拒绝均不得自动重放。
+// adjustOrderPriceWithRetry 为规则改价和 AI 报价共用平台暂忙重试；不可确认的传输结果和终态业务拒绝不得自动重放。
 func (e *automationActionExecutor) adjustOrderPriceWithRetry(ctx context.Context, task Task, priceCents int64) error {
 	// attempt 是当前已发送的改价请求次数，最多执行预设次数以避免无限占用自动化工作线程。
 	for attempt := 1; attempt <= adjustPriceTransientRetryLimit; attempt++ {
@@ -301,7 +332,7 @@ func isAdjustPriceTransientBusy(err error) bool {
 	return strings.Contains(message, "CANNOT_MODIFY_FEE") || strings.Contains(message, "稍后重试") || strings.Contains(message, "稍后再试")
 }
 
-// adjustOrderPriceAttempt 使用凭证快照调用订单改价，并以指纹条件写回响应 Cookie；Session 失效时最多执行一次凭证恢复后重试。
+// adjustOrderPriceAttempt 使用凭证快照调用订单改价，并以指纹条件写回响应 Cookie；仅 Session 失效时最多执行一次账号恢复后重试。
 func (e *automationActionExecutor) adjustOrderPriceAttempt(ctx context.Context, task Task, priceCents int64, allowCredentialRecovery bool) error {
 	// session 固定本次 MTOP 请求的最小凭证视图，外部调用期间不持有账号凭证锁。
 	session, err := e.openShipmentConsignSession(ctx, task.AccountID)
@@ -322,8 +353,10 @@ func (e *automationActionExecutor) adjustOrderPriceAttempt(ctx context.Context, 
 		sessionErr = errors.New(strings.Join(result.returns, "; "))
 	}
 	if mtop.IsSessionExpiredErr(sessionErr) {
+		// credentialLabel 标识唯一允许调用账号恢复器的 Session 失效；Token 已由 MTOP 内部处理。
+		credentialLabel := "Session"
 		if len(persistenceErrs) > 0 {
-			return errors.Join(fmt.Errorf("订单改价 Session 已失效: %w", sessionErr), errors.Join(persistenceErrs...))
+			return errors.Join(fmt.Errorf("订单改价 %s 已失效: %w", credentialLabel, sessionErr), errors.Join(persistenceErrs...))
 		}
 		// recoverer 是当前生效的凭证恢复器快照，避免一次判断期间被替换两次。
 		recoverer := e.recoverer()
@@ -332,19 +365,35 @@ func (e *automationActionExecutor) adjustOrderPriceAttempt(ctx context.Context, 
 			return e.adjustOrderPriceAttempt(ctx, task, priceCents, false)
 		}
 		if !allowCredentialRecovery {
-			return fmt.Errorf("%w: 订单改价在凭证恢复后仍返回 Session 失效: %v", errActionNotPerformed, sessionErr)
+			return fmt.Errorf("%w: 订单改价在凭证恢复后仍返回 %s 失效: %v", errActionNotPerformed, credentialLabel, sessionErr)
 		}
-		return fmt.Errorf("%w: 订单改价 Session 已失效且凭证恢复失败: %v", errActionNotPerformed, sessionErr)
+		return fmt.Errorf("%w: 订单改价 %s 已失效且凭证恢复失败: %v", errActionNotPerformed, credentialLabel, sessionErr)
 	}
 	if result.callErr != nil {
+		// errorKind、hasErrorKind 保存 MTOP 错误分类；明确业务拒绝终止重试，平台系统错误保留为可恢复失败。
+		errorKind, hasErrorKind := mtop.MTopErrorKindOf(result.callErr)
+		if hasErrorKind && errorKind == mtop.MTopErrorBusiness {
+			// failure 标记平台已经明确拒绝的改价，防止零成功动作被通用恢复队列再次提交。
+			failure := noRetryAction(result.callErr)
+			if len(persistenceErrs) > 0 {
+				return errors.Join(failure, errors.Join(persistenceErrs...))
+			}
+			return failure
+		}
+		if hasErrorKind && errorKind == mtop.MTopErrorSystem {
+			if len(persistenceErrs) > 0 {
+				return errors.Join(result.callErr, errors.Join(persistenceErrs...))
+			}
+			return result.callErr
+		}
 		if len(persistenceErrs) > 0 {
 			result.callErr = errors.Join(result.callErr, errors.Join(persistenceErrs...))
 		}
 		return uncertainAction(result.callErr)
 	}
 	if !result.succeeded {
-		// failure 是远端拒绝改价的业务错误，例如订单已付款或已关闭。
-		failure := fmt.Errorf("订单改价失败: %s", strings.Join(result.returns, "; "))
+		// failure 是远端拒绝改价的业务错误，例如订单已付款或已关闭；平台已明确未执行时禁止运行级自动重放。
+		failure := noRetryAction(fmt.Errorf("订单改价失败: %s", strings.Join(result.returns, "; ")))
 		if len(persistenceErrs) > 0 {
 			return errors.Join(failure, errors.Join(persistenceErrs...))
 		}
@@ -373,39 +422,11 @@ func adjustPriceCentsFromConfig(configJSON string) (int64, error) {
 // parseYuanToCents 把以元为单位的十进制金额文本转换为整数分。
 // 允许 0.01 到 1000000 元、至多两位小数；非法格式返回错误。
 func parseYuanToCents(raw string) (int64, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return 0, errors.New("改价动作缺少目标价格")
-	}
-	// wholeText、fracText 分别是金额的整数部分与小数部分文本。
-	wholeText, fracText := raw, ""
-	if // dot 是小数点在金额文本中的位置。
-	dot := strings.IndexByte(raw, '.'); dot >= 0 {
-		wholeText, fracText = raw[:dot], raw[dot+1:]
-	}
-	if wholeText == "" || len(fracText) > 2 {
+	// cents 是统一金额解析器返回的整数分结果。
+	cents, parseErr := money.ParseYuanToCents(raw)
+	if parseErr != nil {
 		return 0, fmt.Errorf("目标价格格式非法: %q", raw)
 	}
-	// whole、wholeErr 分别是整数元部分的数值和解析错误。
-	whole, wholeErr := strconv.ParseInt(wholeText, 10, 64)
-	if wholeErr != nil || whole < 0 {
-		return 0, fmt.Errorf("目标价格格式非法: %q", raw)
-	}
-	// frac 是小数部分折算出的分值。
-	frac := int64(0)
-	if fracText != "" {
-		// fracValue、fracErr 分别是小数部分的数值和解析错误。
-		fracValue, fracErr := strconv.ParseInt(fracText, 10, 64)
-		if fracErr != nil || fracValue < 0 {
-			return 0, fmt.Errorf("目标价格格式非法: %q", raw)
-		}
-		frac = fracValue
-		if len(fracText) == 1 {
-			frac *= 10
-		}
-	}
-	// cents 是目标价格的整数分结果。
-	cents := whole*100 + frac
 	if cents <= 0 || cents > 100000000 {
 		return 0, fmt.Errorf("目标价格必须在 0.01 到 1000000 元之间: %q", raw)
 	}
@@ -563,6 +584,11 @@ func appendTradeText(current, next string) string {
 
 // sendText 向账号在线发送器发送文字消息，并保留确定未发送的错误标记。
 func (e *automationActionExecutor) sendText(ctx context.Context, task Task, text string) error {
+	// executionErr 在平台副作用前拒绝已取消或失去数据库执行权的旧动作。
+	if executionErr := checkRunExecution(ctx); executionErr != nil {
+		return fmt.Errorf("%w: %w", ErrMessageNotSent, executionErr)
+	}
+
 	if task.ChatID == "" || task.BuyerID == "" {
 		return fmt.Errorf("%w: 发送消息缺少 chat_id 或 buyer_id", ErrMessageNotSent)
 	}
@@ -579,6 +605,11 @@ func (e *automationActionExecutor) sendText(ctx context.Context, task Task, text
 
 // sendImage 向账号在线发送器发送图片消息，并标记关联卡密组。
 func (e *automationActionExecutor) sendImage(ctx context.Context, task Task, imageURL string, cardID int64) error {
+	// executionErr 在平台副作用前拒绝已取消或失去数据库执行权的旧动作。
+	if executionErr := checkRunExecution(ctx); executionErr != nil {
+		return fmt.Errorf("%w: %w", ErrMessageNotSent, executionErr)
+	}
+
 	if task.ChatID == "" || task.BuyerID == "" {
 		return fmt.Errorf("%w: 发送图片缺少 chat_id 或 buyer_id", ErrMessageNotSent)
 	}
@@ -637,7 +668,7 @@ func credentialRuntimeFingerprint(data db.CookieRuntimeData) string {
 	return fmt.Sprintf("%x", sum[:])
 }
 
-// actionMatchesOrderSpec 判断动作配置的规格是否匹配订单。
+// actionMatchesOrderSpec 判断动作配置的规格是否匹配订单；账号级且已确认全商品的付款规则允许空规格动作匹配任意订单规格，商品级规则仍要求完整规格相等。
 func actionMatchesOrderSpec(task Task, action db.AutomationAction) bool {
 	// cfg 保存卡密动作的规格过滤配置。
 	var cfg struct {
@@ -648,6 +679,9 @@ func actionMatchesOrderSpec(task Task, action db.AutomationAction) bool {
 		return false
 	}
 	if strings.TrimSpace(cfg.SpecName) == "" && strings.TrimSpace(cfg.SpecValue) == "" {
+		if task.AllowAllItems {
+			return true
+		}
 		return strings.TrimSpace(task.SpecName) == "" && strings.TrimSpace(task.SpecValue) == ""
 	}
 	return orderspec.Equal(task.SpecName, task.SpecValue, cfg.SpecName, cfg.SpecValue)

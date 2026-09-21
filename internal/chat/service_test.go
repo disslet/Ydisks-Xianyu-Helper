@@ -451,6 +451,14 @@ func TestHistoryMessageIsSystem(t *testing.T) {
 	if !historyMessageIsSystem(last, "[我已拍下，待付款]") {
 		t.Fatal("交易卡片应被识别为系统消息")
 	}
+	// reviewEncoded 保存确认收货后评价提醒的 contentType=25 卡片载荷。
+	reviewEncoded := base64.StdEncoding.EncodeToString([]byte(`{"contentType":25,"title":"快给ta一个评价吧～"}`))
+	if !historyMessageIsSystem(map[string]any{
+		"extension": map[string]any{"senderUserId": "peer@goofish"},
+		"content":   map[string]any{"custom": map[string]any{"data": reviewEncoded}},
+	}, "快给ta一个评价吧～") {
+		t.Fatal("评价提醒卡片应被识别为系统消息")
+	}
 	if historyMessageIsSystem(map[string]any{
 		"extension": map[string]any{"senderUserId": "peer@goofish"},
 		"content":   map[string]any{"custom": map[string]any{"summary": "你好"}},
@@ -594,6 +602,50 @@ func TestIncomingMessagePersistsDeduplicatesAndPublishesByOwner(t *testing.T) {
 	event := <-otherEvents:
 		t.Fatalf("other owner leaked event: %+v", event)
 	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+// TestMissingAccountPublicationKeepsManagementSubscriptions 验证已删除账号的迟到事件会被忽略且不会关闭其他管理订阅。
+func TestMissingAccountPublicationKeepsManagementSubscriptions(t *testing.T) {
+	// store 和 cleanup 保存隔离数据库及其清理函数。
+	store, cleanup := chatTestStore(t)
+	defer cleanup()
+	// ctx 保存本地订阅和发布操作的生命周期。
+	ctx := context.Background()
+	// owner 保存测试账号的管理用户。
+	owner, ownerErr := store.Users.GetByUsername(ctx, "owner")
+	if ownerErr != nil {
+		t.Fatal(ownerErr)
+	}
+	// service 保存使用动态账号归属查询的聊天服务。
+	service := New(store)
+	// events、cancel 和 subscribeErr 保存管理订阅、释放函数及创建错误。
+	events, cancel, subscribeErr := service.Subscribe(ctx, owner.ID)
+	if subscribeErr != nil {
+		t.Fatal(subscribeErr)
+	}
+	defer cancel()
+	service.PublishContext(ctx, "missing-account", Event{Type: "message.updated"})
+	select {
+	case // event 和 open 保存缺失账号发布后意外收到的事件及订阅状态。
+	event, open := <-events:
+		if !open {
+			t.Fatal("缺失账号事件不应关闭管理订阅")
+		}
+		t.Fatalf("缺失账号事件不应发布: %+v", event)
+	default:
+	}
+	// expected 保存后续合法账号事件，用于证明原管理订阅仍可继续工作。
+	expected := Event{Type: "message.updated"}
+	service.PublishContext(ctx, "account-1", expected)
+	select {
+	case // event 和 open 保存合法账号发布后的事件及订阅状态。
+	event, open := <-events:
+		if !open || event.Type != expected.Type {
+			t.Fatalf("合法账号事件=%+v open=%v", event, open)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("缺失账号事件后合法发布未到达原订阅")
 	}
 }
 

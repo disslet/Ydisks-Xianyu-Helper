@@ -3,12 +3,14 @@ package adapter
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	chatapp "xianyu-go/internal/application/chat"
 	"xianyu-go/internal/automation"
 	domainchat "xianyu-go/internal/chat"
 	"xianyu-go/internal/db"
+	"xianyu-go/internal/xianyu/cookierefresh"
 	"xianyu-go/internal/xianyu/mtop"
 )
 
@@ -129,6 +131,18 @@ type fakeChatIdentityClient struct {
 	info *mtop.ChatUserInfo
 }
 
+// sessionRefreshingIdentityClient 模拟身份查询通过请求 CookieSession 下发换签 Cookie 的平台响应。
+type sessionRefreshingIdentityClient struct {
+	// mtop.Client 保留未涉及身份查询的接口占位。
+	mtop.Client
+	// info 保存平台返回的非敏感对端身份。
+	info *mtop.ChatUserInfo
+	// snapshot 保存响应后应成为权威状态的完整 Cookie Jar。
+	snapshot []cookierefresh.BrowserCookie
+	// beforeResponse 在向 CookieSession 写入模拟响应前执行，用于模拟并发请求已更新凭证的时序。
+	beforeResponse func()
+}
+
 // fakeChatRefreshFetcher 提供联系人和历史分页的最小运行时能力，用于隔离账号管理器与平台连接。
 type fakeChatRefreshFetcher struct {
 	// MessageSender 占位实现聊天发送端口未涉及的其余运行时方法。
@@ -175,6 +189,20 @@ func (c fakeChatIdentityClient) FetchChatUserInfo(context.Context, string, strin
 	return c.info, nil
 }
 
+// FetchChatUserInfo 将模拟响应 Cookie 吸收进请求会话，验证身份查询也会持久化 Token 换签。
+func (c sessionRefreshingIdentityClient) FetchChatUserInfo(ctx context.Context, _ string, _ string) (*mtop.ChatUserInfo, error) {
+	// session 保存本次平台调用附带的 CookieSession；缺失表示适配器未建立凭证收口边界。
+	session := mtop.CookieSessionFromContext(ctx)
+	if session == nil {
+		return nil, errors.New("身份查询缺少 CookieSession")
+	}
+	if c.beforeResponse != nil {
+		c.beforeResponse()
+	}
+	session.ReplaceSnapshot(c.snapshot)
+	return c.info, nil
+}
+
 // TestChatRepositoryMapsSessionMaintenance 验证聊天数据库适配器覆盖列表、清理、身份和归属端口。
 func TestChatRepositoryMapsSessionMaintenance(t *testing.T) {
 	// store 是使用临时 SQLite 数据库的测试存储。
@@ -202,7 +230,7 @@ func TestChatRepositoryMapsSessionMaintenance(t *testing.T) {
 	}
 	// listed 和 listErr 保存应用层会话列表及转换错误。
 	listed, listErr := port.ListSessions(ctx, owner.ID, "cid", 20)
-	if listErr != nil || len(listed) != 1 || listed[0].BuyerName != "买家" {
+	if listErr != nil || len(listed) != 1 || listed[0].PeerName != "买家" {
 		t.Fatalf("会话列表映射异常 listed=%+v err=%v", listed, listErr)
 	}
 	// owned 和 ownershipErr 保存账号归属查询结果。
@@ -216,7 +244,7 @@ func TestChatRepositoryMapsSessionMaintenance(t *testing.T) {
 	}
 	// refreshed 和 refreshedErr 保存身份缓存写入后的会话列表。
 	refreshed, refreshedErr := port.ListSessions(ctx, owner.ID, "cid", 20)
-	if refreshedErr != nil || refreshed[0].BuyerName != "新名称" || refreshed[0].BuyerAvatar != "avatar" {
+	if refreshedErr != nil || refreshed[0].PeerName != "新名称" || refreshed[0].PeerAvatar != "avatar" {
 		t.Fatalf("身份缓存未更新 refreshed=%+v err=%v", refreshed, refreshedErr)
 	}
 	// emptyErr 保存删除无消息会话壳的结果。
@@ -233,11 +261,76 @@ func TestChatIdentityResolverKeepsCredentialsInsideAdapter(t *testing.T) {
 	// client 是返回非敏感身份的测试 MTOP 客户端。
 	client := fakeChatIdentityClient{info: &mtop.ChatUserInfo{Nickname: "买家新名", AvatarURL: "https://example.invalid/avatar"}}
 	// resolver 是读取 Cookie 并调用测试平台客户端的聊天身份适配器。
-	resolver := NewChatIdentityResolver(store, func() mtop.Client { return client })
+	resolver := NewChatIdentityResolver(store, func() mtop.Client { return client }, nil)
 	// identity 和 resolveErr 保存适配器转换后的身份及查询错误。
 	identity, resolveErr := resolver.Resolve(context.Background(), "cid", "chat-1")
-	if resolveErr != nil || identity.BuyerName != "买家新名" || identity.BuyerAvatar == "" {
+	if resolveErr != nil || identity.PeerName != "买家新名" || identity.PeerAvatar == "" {
 		t.Fatalf("身份映射异常 identity=%+v err=%v", identity, resolveErr)
+	}
+}
+
+// TestChatIdentityResolverPersistsResponseCookie 验证联系人身份查询收到 Token 换签后会写回完整 Cookie Jar。
+func TestChatIdentityResolverPersistsResponseCookie(t *testing.T) {
+	// store、cleanup 保存测试专用数据库及其资源释放责任。
+	store, cleanup := newAdapterTestStore(t)
+	defer cleanup()
+	// snapshot 保存模拟平台下发的完整新 Cookie Jar，包含身份字段和新的签名 Token。
+	snapshot := []cookierefresh.BrowserCookie{
+		{Name: "unb", Value: "1", Domain: ".goofish.com", Path: "/"},
+		{Name: "_m_h5_tk", Value: "fresh_token_1", Domain: ".goofish.com", Path: "/"},
+	}
+	// client 通过调用上下文中的 CookieSession 模拟 Token 过期响应后重新签发 Cookie。
+	client := sessionRefreshingIdentityClient{info: &mtop.ChatUserInfo{Nickname: "买家新名"}, snapshot: snapshot}
+	// resolver 是待验证的身份查询适配器；本用例不需要在线账号运行时同步。
+	resolver := NewChatIdentityResolver(store, func() mtop.Client { return client }, nil)
+	// identity、resolveErr 保存身份查询返回值和平台凭证写回结果。
+	identity, resolveErr := resolver.Resolve(context.Background(), "cid", "chat-1")
+	if resolveErr != nil || identity.PeerName != "买家新名" {
+		t.Fatalf("identity=%+v err=%v", identity, resolveErr)
+	}
+	// runtimeData、dataErr 保存持久化后的最小运行时凭证视图；测试不读取或输出旧 Cookie。
+	runtimeData, dataErr := store.Cookies.GetCookiePlatformRuntimeData(context.Background(), "cid")
+	if dataErr != nil || !strings.Contains(runtimeData.Value, "_m_h5_tk=fresh_token_1") {
+		t.Fatalf("身份查询未持久化换签 Cookie: err=%v", dataErr)
+	}
+	// persistedSnapshot、complete 保存 metadata 中的权威 Cookie Jar，避免回归为仅扁平 Cookie。
+	persistedSnapshot, complete := cookierefresh.SnapshotFromMetadataOK(runtimeData.MetadataJSON)
+	if !complete || len(persistedSnapshot) != len(snapshot) {
+		t.Fatalf("身份查询未持久化完整 Cookie Jar: complete=%v count=%d", complete, len(persistedSnapshot))
+	}
+}
+
+// TestChatIdentityResolverDoesNotFailWhenSiblingRefreshWins 验证并发联系人查询先后换签时，旧响应不会覆盖新凭证或让展示请求失败。
+func TestChatIdentityResolverDoesNotFailWhenSiblingRefreshWins(t *testing.T) {
+	// store、cleanup 保存测试数据库及其资源释放责任。
+	store, cleanup := newAdapterTestStore(t)
+	defer cleanup()
+	// winningCookie 是已由并发请求写入的较新扁平 Cookie，旧请求不得回写覆盖它。
+	winningCookie := "unb=1; _m_h5_tk=winner_token_1"
+	// losingSnapshot 是本次较旧请求随后收到的完整 Cookie Jar。
+	losingSnapshot := []cookierefresh.BrowserCookie{{Name: "unb", Value: "1", Domain: ".goofish.com", Path: "/"}, {Name: "_m_h5_tk", Value: "loser_token_1", Domain: ".goofish.com", Path: "/"}}
+	// client 在返回旧响应前写入胜出的凭证，模拟八个联系人并发补全中的竞争。
+	client := sessionRefreshingIdentityClient{
+		info:     &mtop.ChatUserInfo{Nickname: "买家新名"},
+		snapshot: losingSnapshot,
+		beforeResponse: func() {
+			// updateErr 保存模拟并发写入胜出 Cookie 的持久化结果。
+			if updateErr := store.Cookies.UpdateRenewalCookie(context.Background(), "cid", winningCookie, "", 1); updateErr != nil {
+				t.Fatalf("准备并发凭证失败: %v", updateErr)
+			}
+		},
+	}
+	// resolver 是身份查询适配器；旧请求仍应返回非敏感身份。
+	resolver := NewChatIdentityResolver(store, func() mtop.Client { return client }, nil)
+	// identity、resolveErr 保存竞争发生后的展示结果及错误。
+	identity, resolveErr := resolver.Resolve(context.Background(), "cid", "chat-1")
+	if resolveErr != nil || identity.PeerName != "买家新名" {
+		t.Fatalf("identity=%+v err=%v", identity, resolveErr)
+	}
+	// runtimeData、dataErr 保存最终凭证，必须保持已胜出的新值而非旧响应内容。
+	runtimeData, dataErr := store.Cookies.GetCookiePlatformRuntimeData(context.Background(), "cid")
+	if dataErr != nil || runtimeData.Value != winningCookie {
+		t.Fatalf("旧身份查询覆盖了新凭证: err=%v", dataErr)
 	}
 }
 
@@ -334,8 +427,37 @@ func TestChatImageUploaderPersistsRefreshedCookieAndMapsPlatformErrors(t *testin
 	}
 	// _, persistenceErr 保存刷新凭证持久化失败时的适配错误。
 	_, persistenceErr := NewChatImageUploader(store, func() mtop.Client { return persistenceClient }, nil).UploadChatImage(ctx, "cid", "a.jpg", "image/jpeg", []byte("image"))
-	if persistenceErr == nil {
+	if persistenceErr == nil || strings.Contains(persistenceErr.Error(), "账号凭证已变化") {
 		t.Fatal("数据库关闭后刷新凭证写回应返回错误")
+	}
+}
+
+// TestChatImageUploaderRejectsStaleCookieWriteback 验证图片上传期间的新登录凭证不会被旧响应覆盖。
+func TestChatImageUploaderRejectsStaleCookieWriteback(t *testing.T) {
+	// store、cleanup 保存并发凭证测试使用的隔离数据库及释放函数。
+	store, cleanup := newAdapterTestStore(t)
+	defer cleanup()
+	// latestCookie 表示平台请求期间新登录流程写入的权威凭证。
+	latestCookie := "unb=1; _m_h5_tk=latest;"
+	// client 返回旧响应并在返回前模拟新登录写入。
+	client := fakeChatUploadClient{
+		upload: &mtop.ChatImageUpload{URL: "https://cdn.example/stale.jpg", UpdatedCookies: "unb=1; _m_h5_tk=stale;"},
+		beforeReturn: func() {
+			// updateErr 保存模拟并发登录凭证写入错误。
+			if updateErr := store.Cookies.UpdateValueOwned(context.Background(), "cid", latestCookie, 1); updateErr != nil {
+				t.Fatalf("并发登录凭证写入失败: %v", updateErr)
+			}
+		},
+	}
+	// _, uploadErr 保存检测到凭证指纹冲突后的上传结果。
+	_, uploadErr := NewChatImageUploader(store, func() mtop.Client { return client }, nil).UploadChatImage(context.Background(), "cid", "a.jpg", "image/jpeg", []byte("image"))
+	if uploadErr == nil || !strings.Contains(uploadErr.Error(), "账号凭证已变化") {
+		t.Fatalf("旧图片上传响应未被拒绝: %v", uploadErr)
+	}
+	// stored、storedErr 验证新登录凭证仍是数据库最终状态。
+	stored, storedErr := store.Cookies.GetValue(context.Background(), "cid")
+	if storedErr != nil || stored != latestCookie {
+		t.Fatalf("旧图片上传响应覆盖了新登录凭证 stored=%q err=%v", stored, storedErr)
 	}
 }
 
